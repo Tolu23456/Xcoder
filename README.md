@@ -13,3 +13,4 @@ A high-performance, offline-first code editor built in Rust.
 ## Configuration
 The editor uses a `.xcode` file (TOML) for project-specific workspace state and settings.
 # Xcoder
+# Xcoder
