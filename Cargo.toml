@@ -1,0 +1,20 @@
+[workspace]
+
+members = [
+    "core/xcode-core",
+    "renderer/xcode-renderer",
+    "ui/xcode-ui",
+    "services/xcode-services",
+    "terminal/xcode-terminal",
+    "plugin-runtime/xcode-plugin-runtime"
+]
+
+[package]
+name = "Xcode"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+xcode-renderer = { path = "renderer/xcode-renderer" }
+pollster = "0.4.0"
+# Top-level dependencies for the editor entry point
