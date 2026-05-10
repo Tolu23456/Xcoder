@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bytemuck = { version = "1.21.0", features = ["derive"] }
+taffy = "0.7.1"
 xcode-terminal = { path = "../../terminal/xcode-terminal" }
 xcode-services = { path = "../../services/xcode-services" }
 tree-sitter = "0.24.7"

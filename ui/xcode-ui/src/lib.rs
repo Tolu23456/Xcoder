@@ -3,6 +3,61 @@ use xcode_core::Document;
 use std::path::{PathBuf};
 use taffy::prelude::*;
 
+#[derive(Debug, Clone, Copy)]
+pub struct Color {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+impl Color {
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Self {
+            r: r as f32 / 255.0,
+            g: g as f32 / 255.0,
+            b: b as f32 / 255.0,
+            a: 1.0,
+        }
+    }
+}
+
+pub struct Theme {
+    pub background: Color,
+    pub sidebar_background: Color,
+    pub activity_bar_background: Color,
+    pub status_bar_background: Color,
+    pub editor_background: Color,
+    pub cursor_color: Color,
+    pub selection_color: Color,
+    pub text_default: Color,
+    pub keyword: Color,
+    pub function: Color,
+    pub string: Color,
+    pub comment: Color,
+    pub active_line_bg: Color,
+}
+
+impl Theme {
+    pub fn one_dark() -> Self {
+        Self {
+            background: Color::rgb(33, 37, 43),
+            sidebar_background: Color::rgb(33, 37, 43),
+            activity_bar_background: Color::rgb(40, 44, 52),
+            status_bar_background: Color::rgb(33, 37, 43),
+            editor_background: Color::rgb(40, 44, 52),
+            cursor_color: Color::rgb(82, 139, 255),
+            selection_color: Color::rgb(62, 68, 81),
+            text_default: Color::rgb(171, 178, 191),
+            keyword: Color::rgb(198, 120, 221),
+            function: Color::rgb(97, 175, 239),
+            string: Color::rgb(152, 195, 121),
+            comment: Color::rgb(92, 99, 112),
+            active_line_bg: Color::rgb(44, 49, 58),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EditorState {
     pub document: Document,

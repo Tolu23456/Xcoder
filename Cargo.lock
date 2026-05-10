@@ -3063,10 +3063,12 @@ version = "0.1.0"
 name = "xcode-renderer"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "env_logger",
  "glyphon",
  "log",
  "pollster",
+ "taffy",
  "tree-sitter",
  "tree-sitter-rust",
  "wgpu",
@@ -3081,6 +3083,9 @@ dependencies = [
 name = "xcode-services"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
  "tree-sitter",
  "tree-sitter-rust",
 ]
