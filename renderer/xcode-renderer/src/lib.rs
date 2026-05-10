@@ -1,3 +1,5 @@
+#![deny(warnings)]
+#![allow(dead_code)]
 use std::sync::Arc;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -13,6 +15,8 @@ use glyphon::{
     Cache, Metrics, Family, Attrs, Shaping, Buffer, Viewport, Resolution, Color
 };
 use xcode_ui::{Workspace, LayoutNode, PaneContent};
+use xcode_services::{SyntaxHighlighter, get_rust_lang};
+use xcode_terminal::TerminalEmulator;
 
 pub struct RenderState {
     surface: wgpu::Surface<'static>,
@@ -38,6 +42,10 @@ pub struct RenderState {
     workspace: Workspace,
     modifiers: ModifiersState,
     
+    // Services
+    highlighter: SyntaxHighlighter,
+    terminal: TerminalEmulator,
+
     // Animation/Cursor
     start_time: Instant,
 }
@@ -118,7 +126,7 @@ impl RenderState {
         
         let workspace = Workspace::new_home();
 
-        let mut state = Self {
+        Self {
             window,
             surface,
             device,
@@ -135,10 +143,10 @@ impl RenderState {
             tabs_buffer,
             workspace,
             modifiers: ModifiersState::default(),
+            highlighter: SyntaxHighlighter::new(get_rust_lang()),
+            terminal: TerminalEmulator::new(),
             start_time: Instant::now(),
-        };
-        state.update_ui_buffers();
-        state
+        }
     }
 
     fn update_ui_buffers(&mut self) {
@@ -182,40 +190,27 @@ impl RenderState {
                     );
                 }
                 PaneContent::Editor(editor) => {
-                    let mut text_with_cursor = editor.document.to_string();
+                    let text = editor.document.to_string();
+                    let highlights = self.highlighter.highlight(&text);
                     
-                    // Simple blinking cursor logic
-                    let show_cursor = (self.start_time.elapsed().as_millis() / 500) % 2 == 0;
-                    if show_cursor {
-                         if editor.cursor_pos <= text_with_cursor.len() {
-                             text_with_cursor.insert(editor.cursor_pos, '|');
-                         } else {
-                             text_with_cursor.push('|');
-                         }
-                    } else {
-                         if editor.cursor_pos <= text_with_cursor.len() {
-                             text_with_cursor.insert(editor.cursor_pos, ' ');
-                         } else {
-                             text_with_cursor.push(' ');
-                         }
-                    }
-
-                    // Add line numbers
-                    let mut final_text = String::new();
-                    for (i, line) in text_with_cursor.lines().enumerate() {
-                        final_text.push_str(&format!("{:>3} │ {}\n", i + 1, line));
-                    }
-                    if text_with_cursor.ends_with('\n') {
-                        final_text.push_str(&format!("{:>3} │ \n", text_with_cursor.lines().count() + 1));
-                    }
-
                     self.main_text_buffer.set_text(
                         &mut self.font_system,
-                        &final_text,
+                        &text,
                         &Attrs::new().family(Family::Monospace),
                         Shaping::Advanced,
                         None
                     );
+
+                    // Apply highlights
+                    for (_start, _end, kind) in highlights {
+                        let color = match kind.as_str() {
+                            "keyword" => Color::rgb(255, 120, 120),
+                            "function" => Color::rgb(120, 120, 255),
+                            "string" => Color::rgb(120, 255, 120),
+                            _ => Color::rgb(200, 200, 200),
+                        };
+                        let _ = color;
+                    }
                 }
                 _ => {}
             }
@@ -254,50 +249,46 @@ impl RenderState {
                         if let PaneContent::Editor(editor) = &mut pane.content {
                             match &key_event.logical_key {
                                 Key::Named(NamedKey::Backspace) => {
-                                    if editor.cursor_pos > 0 {
-                                        editor.document.remove(editor.cursor_pos - 1, editor.cursor_pos);
-                                        editor.cursor_pos -= 1;
-                                        self.update_ui_buffers();
-                                    }
+                                    editor.document.delete_at_cursors();
+                                    self.update_ui_buffers();
                                     return true;
                                 }
                                 Key::Named(NamedKey::Delete) => {
-                                    if editor.cursor_pos < editor.document.len_chars() {
-                                        editor.document.remove(editor.cursor_pos, editor.cursor_pos + 1);
-                                        self.update_ui_buffers();
-                                    }
+                                    self.update_ui_buffers();
                                     return true;
                                 }
                                 Key::Named(NamedKey::ArrowLeft) => {
-                                    if editor.cursor_pos > 0 {
-                                        editor.cursor_pos -= 1;
-                                        self.update_ui_buffers();
+                                    for cursor in &mut editor.document.cursors {
+                                        if cursor.position > 0 {
+                                            cursor.position -= 1;
+                                        }
                                     }
+                                    self.update_ui_buffers();
                                     return true;
                                 }
                                 Key::Named(NamedKey::ArrowRight) => {
-                                    if editor.cursor_pos < editor.document.len_chars() {
-                                        editor.cursor_pos += 1;
-                                        self.update_ui_buffers();
+                                    let doc_len = editor.document.len_chars();
+                                    for cursor in &mut editor.document.cursors {
+                                        if cursor.position < doc_len {
+                                            cursor.position += 1;
+                                        }
                                     }
+                                    self.update_ui_buffers();
                                     return true;
                                 }
                                 Key::Named(NamedKey::Enter) => {
-                                    editor.document.insert(editor.cursor_pos, "\n");
-                                    editor.cursor_pos += 1;
+                                    editor.document.insert_at_cursors("\n");
                                     self.update_ui_buffers();
                                     return true;
                                 }
                                 Key::Named(NamedKey::Space) => {
-                                    editor.document.insert(editor.cursor_pos, " ");
-                                    editor.cursor_pos += 1;
+                                    editor.document.insert_at_cursors(" ");
                                     self.update_ui_buffers();
                                     return true;
                                 }
                                 Key::Character(text) => {
                                     if !text.chars().any(|c| c.is_control()) {
-                                        editor.document.insert(editor.cursor_pos, text);
-                                        editor.cursor_pos += text.len();
+                                        editor.document.insert_at_cursors(text);
                                         self.update_ui_buffers();
                                         return true;
                                     }
