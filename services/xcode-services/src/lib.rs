@@ -1,6 +1,7 @@
 #![deny(warnings)]
 #![allow(dead_code)]
 use tree_sitter::{Parser, Language, Tree};
+use std::ops::Range;
 use std::process::{Command, Stdio, Child};
 use std::io::{BufReader, BufRead, Write, Read};
 use serde::{Serialize, Deserialize};
@@ -23,8 +24,10 @@ impl SyntaxHighlighter {
         }
     }
 
-    pub fn highlight(&mut self, source: &str) -> Vec<(usize, usize, String)> {
-        self.tree = self.parser.parse(source, self.tree.as_ref());
+    pub fn highlight(&mut self, full_source: &str, _visible_range: Range<usize>) -> Vec<(usize, usize, String)> {
+        // Tree-sitter handles the context best when it has the whole file.
+        // We parse the entire file incrementally.
+        self.tree = self.parser.parse(full_source, self.tree.as_ref());
         let mut highlights = Vec::new();
         if let Some(tree) = &self.tree {
             let mut cursor = tree.walk();
@@ -201,6 +204,19 @@ impl LspClient {
                 "version": version
             },
             "contentChanges": [{ "text": text }]
+        }))
+    }
+
+    pub fn did_change_incremental(&mut self, uri: &str, version: i32, range: serde_json::Value, text: &str) -> Result<()> {
+        self.send_notification("textDocument/didChange", serde_json::json!({
+            "textDocument": {
+                "uri": uri,
+                "version": version
+            },
+            "contentChanges": [{
+                "range": range,
+                "text": text
+            }]
         }))
     }
 

@@ -1,5 +1,4 @@
 #![deny(warnings)]
-#![allow(dead_code)]
 
 mod rect;
 
@@ -57,13 +56,13 @@ pub struct RenderState {
     root_node: NodeId,
     activity_node: NodeId,
     sidebar_node: NodeId,
-    content_node: NodeId,
+    _content_node: NodeId,
     tabs_node: NodeId,
     gutter_node: NodeId,
     editor_node: NodeId,
     editor_container_node: NodeId,
     terminal_node: NodeId,
-    status_node: NodeId,
+    _status_node: NodeId,
 
     // Workspace State
     workspace: xcode_ui::Workspace,
@@ -88,6 +87,8 @@ pub struct RenderState {
 
     // Services
     highlighter: SyntaxHighlighter,
+    highlights_cache: Vec<(usize, usize, String)>,
+    text_cache: String,
     terminal: TerminalEmulatorWrapper,
     lsp: Option<LspClient>,
     lsp_version: i32,
@@ -348,13 +349,13 @@ impl RenderState {
             root_node,
             activity_node,
             sidebar_node,
-            content_node,
+            _content_node: content_node,
             tabs_node,
             gutter_node,
             editor_node,
             editor_container_node,
             terminal_node,
-            status_node,
+            _status_node: status_node,
             workspace,
             sidebar_selected_index: 0,
             modifiers: ModifiersState::default(),
@@ -369,6 +370,8 @@ impl RenderState {
             completion_items: Vec::new(),
             diagnostics: Vec::new(),
             highlighter: SyntaxHighlighter::new(get_rust_lang()),
+            highlights_cache: Vec::new(),
+            text_cache: String::new(),
             terminal: TerminalEmulatorWrapper::new(),
             lsp,
             lsp_version: 1,
@@ -576,16 +579,28 @@ impl RenderState {
                     let start_line = (self.current_scroll_offset / line_height) as usize;
                     let end_line =
                         (start_line + visible_lines).min(editor.document.buffer.line_count());
+
+                    if self.text_cache.is_empty() || self.highlights_cache.is_empty() {
+                        self.text_cache = editor.document.to_string();
+                        self.highlights_cache = self.highlighter.highlight(&self.text_cache, 0..self.text_cache.len());
+                    }
+
                     let mut visible_text = String::new();
-                    for i in start_line..end_line {
+                    let mut current_offset = 0;
+                    for i in 0..editor.document.buffer.line_count() {
                         if let Some(line) = editor.document.buffer.get_line(i) {
-                            visible_text.push_str(&line);
-                            if !line.ends_with('\n') {
-                                visible_text.push('\n');
+                            if i >= start_line && i < end_line {
+                                visible_text.push_str(&line);
+                                if !line.ends_with('\n') {
+                                    visible_text.push('\n');
+                                }
+                            }
+                            if i < start_line {
+                                current_offset += line.len();
                             }
                         }
                     }
-                    let highlights = self.highlighter.highlight(&visible_text);
+
                     let mut rich_text = Vec::new();
                     let mut last_idx = 0;
                     let text_default = self.to_glyphon_color(self.theme.text_default);
@@ -593,10 +608,17 @@ impl RenderState {
                     let function_color = self.to_glyphon_color(self.theme.function);
                     let string_color = self.to_glyphon_color(self.theme.string);
 
-                    for (start, end, kind) in highlights {
-                        if start > last_idx {
+                    for (start, end, kind) in &self.highlights_cache {
+                        let start = *start;
+                        let end = *end;
+                        if end <= current_offset { continue; }
+                        let visible_start = start.saturating_sub(current_offset);
+                        let visible_end = (end - current_offset).min(visible_text.len());
+                        if visible_start >= visible_text.len() { break; }
+
+                        if visible_start > last_idx {
                             rich_text.push((
-                                &visible_text[last_idx..start],
+                                &visible_text[last_idx..visible_start],
                                 Attrs::new().family(Family::Monospace).color(text_default),
                             ));
                         }
@@ -614,10 +636,10 @@ impl RenderState {
                             _ => text_default,
                         };
                         rich_text.push((
-                            &visible_text[start..end],
+                            &visible_text[visible_start..visible_end],
                             Attrs::new().family(Family::Monospace).color(color),
                         ));
-                        last_idx = end;
+                        last_idx = visible_end;
                     }
                     if last_idx < visible_text.len() {
                         rich_text.push((
@@ -732,6 +754,26 @@ impl RenderState {
                                 self.palette_query.pop();
                             }
                             Key::Named(NamedKey::Enter) => {
+                                if self.palette_query.starts_with(':') {
+                                    if let Ok(line_num) = self.palette_query[1..].trim().parse::<usize>() {
+                                        let line_idx = line_num.saturating_sub(1);
+                                        if let LayoutNode::Leaf(pane) = &mut self.workspace.root {
+                                            if let PaneContent::Editor(editor) = &mut pane.content {
+                                                let mut offset = 0;
+                                                for i in 0..line_idx.min(editor.document.buffer.line_count()) {
+                                                    if let Some(line) = editor.document.buffer.get_line(i) {
+                                                        offset += line.len();
+                                                    }
+                                                }
+                                                editor.cursor_pos = offset;
+                                                editor.document.cursors = vec![xcode_core::Cursor { position: offset, selection_anchor: None }];
+                                                let line_height = 19.0;
+                                                self.target_scroll_offset = (line_idx as f32 * line_height) - (self.size.height as f32 / 3.0);
+                                                self.target_scroll_offset = self.target_scroll_offset.max(0.0);
+                                            }
+                                        }
+                                    }
+                                }
                                 self.palette_open = false;
                             }
                             Key::Character(text) => {
@@ -839,9 +881,10 @@ impl RenderState {
                     if let LayoutNode::Leaf(pane) = &mut self.workspace.root {
                         if let PaneContent::Editor(editor) = &mut pane.content {
                             let mut changed = false;
+                            let mut lsp_changes = Vec::new();
                             match &key_event.logical_key {
                                 Key::Named(NamedKey::Backspace) => {
-                                    editor.document.delete_at_cursors();
+                                    lsp_changes = editor.document.delete_at_cursors();
                                     changed = true;
                                 }
                                 Key::Named(NamedKey::ArrowLeft) => {
@@ -861,16 +904,16 @@ impl RenderState {
                                     editor.cursor_pos = editor.document.cursors[0].position;
                                 }
                                 Key::Named(NamedKey::Enter) => {
-                                    editor.document.insert_at_cursors("\n");
+                                    lsp_changes = editor.document.insert_at_cursors("\n");
                                     changed = true;
                                 }
                                 Key::Named(NamedKey::Space) => {
-                                    editor.document.insert_at_cursors(" ");
+                                    lsp_changes = editor.document.insert_at_cursors(" ");
                                     changed = true;
                                 }
                                 Key::Character(text) => {
                                     if !text.chars().any(|c| c.is_control()) {
-                                        editor.document.insert_at_cursors(text);
+                                        lsp_changes = editor.document.insert_at_cursors(text);
                                         changed = true;
                                     }
                                 }
@@ -881,8 +924,18 @@ impl RenderState {
                                 let (line, character) =
                                     editor.document.get_line_col(editor.cursor_pos);
                                 self.lsp_version += 1;
+                                self.text_cache.clear();
+                                self.highlights_cache.clear();
                                 if let Some(lsp) = &mut self.lsp {
-                                    let _ = lsp.did_change(&uri, self.lsp_version, &editor.document.to_string());
+                                    for (range, text) in lsp_changes {
+                                        let (start_line, start_col) = editor.document.get_line_col(range.start);
+                                        let (end_line, end_col) = editor.document.get_line_col(range.end);
+                                        let lsp_range = serde_json::json!({
+                                            "start": { "line": start_line, "character": start_col },
+                                            "end": { "line": end_line, "character": end_col }
+                                        });
+                                        let _ = lsp.did_change_incremental(&uri, self.lsp_version, lsp_range, &text);
+                                    }
                                     if let Ok(id) = lsp.completion(&uri, line, character) {
                                         self.pending_lsp_requests.push(id);
                                     }

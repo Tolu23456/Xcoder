@@ -83,7 +83,14 @@ impl EditorState {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        std::fs::write(&self.path, self.document.to_string())
+        let mut temp_path = self.path.clone();
+        temp_path.set_extension("tmp");
+
+        let file = std::fs::File::create(&temp_path)?;
+        self.document.buffer.stream_write(file)?;
+
+        std::fs::rename(&temp_path, &self.path)?;
+        Ok(())
     }
 }
 
