@@ -1,25 +1,26 @@
 #![deny(warnings)]
 #![allow(dead_code)]
+
 mod rect;
 
-use std::sync::Arc;
+use crate::rect::{RectRenderer, RectVertex};
+use glyphon::{
+    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
+    TextAtlas, TextBounds, TextArea, TextRenderer, Viewport,
+};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
+use taffy::prelude::*;
 use winit::{
     application::ApplicationHandler,
     event::*,
     event_loop::{ActiveEventLoop, EventLoop},
-    window::{Window, WindowId},
     keyboard::{Key, NamedKey, ModifiersState},
+    window::{Window, WindowId},
 };
-use glyphon::{
-    FontSystem, SwashCache, TextAtlas, TextRenderer, TextArea, TextBounds,
-    Cache, Metrics, Family, Attrs, Shaping, Buffer, Viewport, Resolution, Color
-};
-use xcode_ui::{Workspace, LayoutNode, PaneContent, Theme};
-use xcode_services::{SyntaxHighlighter, get_rust_lang, LspClient};
-use xcode_terminal::TerminalEmulator;
-use crate::rect::{RectRenderer, RectVertex};
+use xcode_services::{get_rust_lang, LspClient, SyntaxHighlighter};
+use xcode_ui::{LayoutNode, PaneContent, Theme};
 
 pub struct RenderState {
     surface: wgpu::Surface<'static>,
@@ -35,7 +36,7 @@ pub struct RenderState {
     viewport: Viewport,
     text_atlas: TextAtlas,
     text_renderer: TextRenderer,
-    
+
     // Rect rendering
     rect_renderer: RectRenderer,
 
@@ -51,31 +52,33 @@ pub struct RenderState {
 
     // Layout
     taffy: taffy::TaffyTree<()>,
-    root_node: taffy::NodeId,
-    activity_node: taffy::NodeId,
-    sidebar_node: taffy::NodeId,
-    content_node: taffy::NodeId,
-    tabs_node: taffy::NodeId,
-    editor_node: taffy::NodeId,
-    terminal_node: taffy::NodeId,
-    status_node: taffy::NodeId,
+    root_node: NodeId,
+    activity_node: NodeId,
+    sidebar_node: NodeId,
+    content_node: NodeId,
+    tabs_node: NodeId,
+    editor_node: NodeId,
+    terminal_node: NodeId,
+    status_node: NodeId,
 
     // Workspace State
-    workspace: Workspace,
+    workspace: xcode_ui::Workspace,
     modifiers: ModifiersState,
     theme: Theme,
 
     // Command Palette
     palette_open: bool,
     palette_query: String,
+    palette_anim: f32,
 
     // Hover Popup
     hover_open: bool,
     hover_text: String,
+    hover_anim: f32,
 
     // Services
     highlighter: SyntaxHighlighter,
-    terminal: TerminalEmulator,
+    terminal: TerminalEmulatorWrapper,
     lsp: Option<LspClient>,
     lsp_version: i32,
 
@@ -86,6 +89,18 @@ pub struct RenderState {
     start_time: Instant,
     target_scroll_offset: f32,
     current_scroll_offset: f32,
+}
+
+struct TerminalEmulatorWrapper {
+    inner: xcode_terminal::TerminalEmulator,
+}
+
+impl TerminalEmulatorWrapper {
+    fn new() -> Self {
+        Self {
+            inner: xcode_terminal::TerminalEmulator::new(),
+        }
+    }
 }
 
 impl RenderState {
@@ -156,63 +171,115 @@ impl RenderState {
             None,
         );
         let mut viewport = Viewport::new(&device, &cache);
-        viewport.update(&queue, Resolution { width: size.width, height: size.height });
-        
+        viewport.update(
+            &queue,
+            Resolution {
+                width: size.width,
+                height: size.height,
+            },
+        );
+
         let rect_renderer = RectRenderer::new(&device, surface_format);
 
-        let main_text_buffer = Buffer::new(&mut font_system, Metrics::new(14.0, 20.0));
+        let main_text_buffer = Buffer::new(&mut font_system, Metrics::new(13.0, 19.0));
         let sidebar_buffer = Buffer::new(&mut font_system, Metrics::new(12.0, 18.0));
-        let tabs_buffer = Buffer::new(&mut font_system, Metrics::new(12.0, 24.0));
-        let status_buffer = Buffer::new(&mut font_system, Metrics::new(12.0, 18.0));
+        let tabs_buffer = Buffer::new(&mut font_system, Metrics::new(11.0, 24.0));
+        let status_buffer = Buffer::new(&mut font_system, Metrics::new(11.0, 18.0));
         let terminal_buffer = Buffer::new(&mut font_system, Metrics::new(12.0, 18.0));
-        let activity_buffer = Buffer::new(&mut font_system, Metrics::new(20.0, 30.0));
-        let palette_buffer = Buffer::new(&mut font_system, Metrics::new(14.0, 24.0));
+        let activity_buffer = Buffer::new(&mut font_system, Metrics::new(18.0, 40.0));
+        let palette_buffer = Buffer::new(&mut font_system, Metrics::new(13.0, 24.0));
         let hover_buffer = Buffer::new(&mut font_system, Metrics::new(12.0, 18.0));
 
         let mut taffy: taffy::TaffyTree<()> = taffy::TaffyTree::new();
-        let activity_node = taffy.new_leaf(taffy::Style {
-            size: taffy::Size { width: taffy::prelude::length(50.0), height: taffy::prelude::percent(1.0) },
-            ..Default::default()
-        }).unwrap();
+        let activity_node = taffy
+            .new_leaf(Style {
+                size: Size {
+                    width: length(48.0),
+                    height: percent(1.0),
+                },
+                ..Default::default()
+            })
+            .unwrap();
 
-        let sidebar_node = taffy.new_leaf(taffy::Style {
-            size: taffy::Size { width: taffy::prelude::length(200.0), height: taffy::prelude::percent(1.0) },
-            ..Default::default()
-        }).unwrap();
+        let sidebar_node = taffy
+            .new_leaf(Style {
+                size: Size {
+                    width: length(220.0),
+                    height: percent(1.0),
+                },
+                ..Default::default()
+            })
+            .unwrap();
 
-        let tabs_node = taffy.new_leaf(taffy::Style {
-            size: taffy::Size { width: taffy::prelude::percent(1.0), height: taffy::prelude::length(30.0) },
-            ..Default::default()
-        }).unwrap();
+        let tabs_node = taffy
+            .new_leaf(Style {
+                size: Size {
+                    width: percent(1.0),
+                    height: length(32.0),
+                },
+                ..Default::default()
+            })
+            .unwrap();
 
-        let editor_node = taffy.new_leaf(taffy::Style {
-            size: taffy::Size { width: taffy::prelude::percent(1.0), height: taffy::prelude::percent(0.6) },
-            ..Default::default()
-        }).unwrap();
+        let editor_node = taffy
+            .new_leaf(Style {
+                size: Size {
+                    width: percent(1.0),
+                    height: percent(0.65),
+                },
+                ..Default::default()
+            })
+            .unwrap();
 
-        let terminal_node = taffy.new_leaf(taffy::Style {
-            size: taffy::Size { width: taffy::prelude::percent(1.0), height: taffy::prelude::length(150.0) },
-            ..Default::default()
-        }).unwrap();
+        let terminal_node = taffy
+            .new_leaf(Style {
+                size: Size {
+                    width: percent(1.0),
+                    height: percent(0.35),
+                },
+                ..Default::default()
+            })
+            .unwrap();
 
-        let content_node = taffy.new_with_children(taffy::Style {
-            flex_direction: taffy::FlexDirection::Column,
-            size: taffy::Size { width: taffy::prelude::percent(0.8), height: taffy::prelude::percent(1.0) },
-            ..Default::default()
-        }, &[tabs_node, editor_node, terminal_node]).unwrap();
+        let content_node = taffy
+            .new_with_children(
+                Style {
+                    flex_direction: FlexDirection::Column,
+                    size: Size {
+                        width: percent(0.8),
+                        height: percent(1.0),
+                    },
+                    ..Default::default()
+                },
+                &[tabs_node, editor_node, terminal_node],
+            )
+            .unwrap();
 
-        let status_node = taffy.new_leaf(taffy::Style {
-            size: taffy::Size { width: taffy::prelude::percent(1.0), height: taffy::prelude::length(20.0) },
-            ..Default::default()
-        }).unwrap();
+        let status_node = taffy
+            .new_leaf(Style {
+                size: Size {
+                    width: percent(1.0),
+                    height: length(22.0),
+                },
+                ..Default::default()
+            })
+            .unwrap();
 
-        let root_node = taffy.new_with_children(taffy::Style {
-            flex_direction: taffy::FlexDirection::Row,
-            size: taffy::Size { width: taffy::prelude::percent(1.0), height: taffy::prelude::percent(1.0) },
-            ..Default::default()
-        }, &[activity_node, sidebar_node, content_node]).unwrap();
-        
-        let workspace = Workspace::new_home();
+        let root_node = taffy
+            .new_with_children(
+                Style {
+                    flex_direction: FlexDirection::Row,
+                    size: Size {
+                        width: percent(1.0),
+                        height: percent(1.0),
+                    },
+                    ..Default::default()
+                },
+                &[activity_node, sidebar_node, content_node],
+            )
+            .unwrap();
+
+        let workspace = xcode_ui::Workspace::new_home();
         let mut lsp = LspClient::new("rust-analyzer").ok();
         if let Some(client) = &mut lsp {
             let _ = client.initialize("file://.");
@@ -253,10 +320,12 @@ impl RenderState {
             theme: Theme::one_dark(),
             palette_open: false,
             palette_query: String::new(),
+            palette_anim: 0.0,
             hover_open: false,
             hover_text: String::new(),
+            hover_anim: 0.0,
             highlighter: SyntaxHighlighter::new(get_rust_lang()),
-            terminal: TerminalEmulator::new(),
+            terminal: TerminalEmulatorWrapper::new(),
             lsp,
             lsp_version: 1,
             pending_lsp_requests: Vec::new(),
@@ -268,31 +337,46 @@ impl RenderState {
 
     fn update_ui_buffers(&mut self) {
         let lerp_factor = 0.1;
-        self.current_scroll_offset += (self.target_scroll_offset - self.current_scroll_offset) * lerp_factor;
+        self.current_scroll_offset +=
+            (self.target_scroll_offset - self.current_scroll_offset) * lerp_factor;
         if (self.target_scroll_offset - self.current_scroll_offset).abs() < 0.1 {
             self.current_scroll_offset = self.target_scroll_offset;
         }
-
+        if self.palette_open {
+            self.palette_anim = (self.palette_anim + 0.1).min(1.0);
+        } else {
+            self.palette_anim = (self.palette_anim - 0.1).max(0.0);
+        }
+        if self.hover_open {
+            self.hover_anim = (self.hover_anim + 0.1).min(1.0);
+        } else {
+            self.hover_anim = (self.hover_anim - 0.1).max(0.0);
+        }
         if let Some(lsp) = &self.lsp {
             let mut i = 0;
             while i < self.pending_lsp_requests.len() {
                 let id = self.pending_lsp_requests[i];
                 if let Some(response) = lsp.get_response(id) {
                     if let Some(result) = response.get("result") {
-                         if let Some(uri) = result.get("uri").or_else(|| result.get(0).and_then(|r| r.get("uri"))) {
-                             if let Some(path_str) = uri.as_str().and_then(|s| s.strip_prefix("file://")) {
-                                 self.workspace.open_editor(PathBuf::from(path_str));
-                             }
-                         }
-                         if let Some(contents) = result.get("contents") {
-                             if let Some(value) = contents.get("value") {
-                                 self.hover_text = value.as_str().unwrap_or("").to_string();
-                                 self.hover_open = true;
-                             } else if let Some(s) = contents.as_str() {
-                                 self.hover_text = s.to_string();
-                                 self.hover_open = true;
-                             }
-                         }
+                        if let Some(uri) = result
+                            .get("uri")
+                            .or_else(|| result.get(0).and_then(|r| r.get("uri")))
+                        {
+                            if let Some(path_str) =
+                                uri.as_str().and_then(|s| s.strip_prefix("file://"))
+                            {
+                                self.workspace.open_editor(PathBuf::from(path_str));
+                            }
+                        }
+                        if let Some(contents) = result.get("contents") {
+                            if let Some(value) = contents.get("value") {
+                                self.hover_text = value.as_str().unwrap_or("").to_string();
+                                self.hover_open = true;
+                            } else if let Some(s) = contents.as_str() {
+                                self.hover_text = s.to_string();
+                                self.hover_open = true;
+                            }
+                        }
                     }
                     self.pending_lsp_requests.remove(i);
                 } else {
@@ -300,57 +384,110 @@ impl RenderState {
                 }
             }
         }
-
         let mut sidebar_text = String::from(" PROJECT\n ───────\n");
         for file in &self.workspace.files {
             let icon = if file.is_dir { "📁" } else { "📄" };
             sidebar_text.push_str(&format!(" {} {}\n", icon, file.name));
         }
-        self.sidebar_buffer.set_text(&mut self.font_system, &sidebar_text, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
-
-        self.tabs_buffer.set_text(&mut self.font_system, "  main.rs  |  lib.rs  |  Cargo.toml  ", &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
-
+        self.sidebar_buffer.set_text(
+            &mut self.font_system,
+            &sidebar_text,
+            &Attrs::new().family(Family::SansSerif),
+            Shaping::Advanced,
+            None,
+        );
+        self.tabs_buffer.set_text(
+            &mut self.font_system,
+            "  main.rs  |  lib.rs  |  Cargo.toml  ",
+            &Attrs::new().family(Family::SansSerif),
+            Shaping::Advanced,
+            None,
+        );
         let mut status_text = String::from(" [ LSP: ");
-        if self.lsp.is_some() { status_text.push_str("Connected ] "); } else { status_text.push_str("Disconnected ] "); }
+        if self.lsp.is_some() {
+            status_text.push_str("Connected ] ");
+        } else {
+            status_text.push_str("Disconnected ] ");
+        }
         status_text.push_str(" | Rust | UTF-8");
-        self.status_buffer.set_text(&mut self.font_system, &status_text, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
-
+        self.status_buffer.set_text(
+            &mut self.font_system,
+            &status_text,
+            &Attrs::new().family(Family::SansSerif),
+            Shaping::Advanced,
+            None,
+        );
         let display_output = {
-            let terminal_output = self.terminal.output.lock().unwrap();
+            let terminal_output = self.terminal.inner.output.lock().unwrap();
             let lines: Vec<&str> = terminal_output.lines().rev().take(10).collect();
             let mut out = String::new();
-            for line in lines.into_iter().rev() { out.push_str(line); out.push('\n'); }
+            for line in lines.into_iter().rev() {
+                out.push_str(line);
+                out.push('\n');
+            }
             out
         };
-        self.terminal_buffer.set_text(&mut self.font_system, &display_output, &Attrs::new().family(Family::Monospace), Shaping::Advanced, None);
-
-        self.activity_buffer.set_text(&mut self.font_system, " 📂\n 🔍\n ⚙️", &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
-
-        if self.palette_open {
-             self.palette_buffer.set_text(&mut self.font_system, &format!(" > {}", self.palette_query), &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
+        self.terminal_buffer.set_text(
+            &mut self.font_system,
+            &display_output,
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        self.activity_buffer.set_text(
+            &mut self.font_system,
+            " 📂\n 🔍\n ⚙️",
+            &Attrs::new().family(Family::SansSerif),
+            Shaping::Advanced,
+            None,
+        );
+        if self.palette_anim > 0.0 {
+            self.palette_buffer.set_text(
+                &mut self.font_system,
+                &format!(" > {}", self.palette_query),
+                &Attrs::new().family(Family::SansSerif),
+                Shaping::Advanced,
+                None,
+            );
         }
-
-        if self.hover_open {
-             self.hover_buffer.set_text(&mut self.font_system, &self.hover_text, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
-             self.hover_buffer.set_size(&mut self.font_system, Some(300.0), None);
+        if self.hover_anim > 0.0 {
+            self.hover_buffer.set_text(
+                &mut self.font_system,
+                &self.hover_text,
+                &Attrs::new().family(Family::SansSerif),
+                Shaping::Advanced,
+                None,
+            );
+            self.hover_buffer
+                .set_size(&mut self.font_system, Some(300.0), None);
         }
-
         if let LayoutNode::Leaf(pane) = &self.workspace.root {
             match &pane.content {
                 PaneContent::Home => {
                     let home_text = "\n\n      [ Xcode ]\n\n   Welcome to Xcode\n\n   - Press Ctrl+N for New File\n   - Press Esc to Exit\n\n   (Offline-First Edition)";
-                    self.main_text_buffer.set_text(&mut self.font_system, home_text, &Attrs::new().family(Family::Monospace).weight(glyphon::Weight::BOLD), Shaping::Advanced, None);
+                    self.main_text_buffer.set_text(
+                        &mut self.font_system,
+                        home_text,
+                        &Attrs::new()
+                            .family(Family::Monospace)
+                            .weight(glyphon::Weight::BOLD),
+                        Shaping::Advanced,
+                        None,
+                    );
                 }
                 PaneContent::Editor(editor) => {
-                    let line_height = 20.0;
+                    let line_height = 19.0;
                     let visible_lines = (self.size.height as f32 / line_height) as usize + 2;
                     let start_line = (self.current_scroll_offset / line_height) as usize;
-                    let end_line = (start_line + visible_lines).min(editor.document.buffer.line_count());
+                    let end_line =
+                        (start_line + visible_lines).min(editor.document.buffer.line_count());
                     let mut visible_text = String::new();
                     for i in start_line..end_line {
                         if let Some(line) = editor.document.buffer.get_line(i) {
-                             visible_text.push_str(&format!("{:>3} │ {}", i + 1, line));
-                             if !line.ends_with('\n') { visible_text.push('\n'); }
+                            visible_text.push_str(&format!("{:>3} │ {}", i + 1, line));
+                            if !line.ends_with('\n') {
+                                visible_text.push('\n');
+                            }
                         }
                     }
                     let highlights = self.highlighter.highlight(&visible_text);
@@ -359,33 +496,73 @@ impl RenderState {
                     let text_default = self.to_glyphon_color(self.theme.text_default);
                     let keyword_color = self.to_glyphon_color(self.theme.keyword);
                     let function_color = self.to_glyphon_color(self.theme.function);
-                    let string_color = self.to_glyphon_color(self.theme.string);
                     for (start, end, kind) in highlights {
-                        if start > last_idx { rich_text.push((&visible_text[last_idx..start], Attrs::new().family(Family::Monospace).color(text_default))); }
-                        let color = match kind.as_str() { "keyword" => keyword_color, "function" => function_color, "string" => string_color, _ => text_default, };
-                        rich_text.push((&visible_text[start..end], Attrs::new().family(Family::Monospace).color(color)));
+                        if start > last_idx {
+                            rich_text.push((
+                                &visible_text[last_idx..start],
+                                Attrs::new().family(Family::Monospace).color(text_default),
+                            ));
+                        }
+                        let color = match kind.as_str() {
+                            "fn" | "let" | "pub" | "use" | "match" | "if" | "else" | "struct"
+                            | "enum" | "impl" | "trait" | "type" | "mod" | "static" | "const"
+                            | "return" | "break" | "continue" | "for" | "while" | "loop" => {
+                                keyword_color
+                            }
+                            "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16"
+                            | "i32" | "i64" | "i128" | "isize" | "f32" | "f64" | "str"
+                            | "String" | "Vec" | "Option" | "Result" | "bool" | "true"
+                            | "false" => function_color,
+                            _ => text_default,
+                        };
+                        rich_text.push((
+                            &visible_text[start..end],
+                            Attrs::new().family(Family::Monospace).color(color),
+                        ));
                         last_idx = end;
                     }
-                    if last_idx < visible_text.len() { rich_text.push((&visible_text[last_idx..], Attrs::new().family(Family::Monospace).color(text_default))); }
-                    self.main_text_buffer.set_rich_text(&mut self.font_system, rich_text, &Attrs::new().family(Family::Monospace), Shaping::Advanced, None);
+                    if last_idx < visible_text.len() {
+                        rich_text.push((
+                            &visible_text[last_idx..],
+                            Attrs::new().family(Family::Monospace).color(text_default),
+                        ));
+                    }
+                    self.main_text_buffer.set_rich_text(
+                        &mut self.font_system,
+                        rich_text,
+                        &Attrs::new().family(Family::Monospace),
+                        Shaping::Advanced,
+                        None,
+                    );
                 }
                 _ => {}
             }
         }
-        self.main_text_buffer.shape_until_scroll(&mut self.font_system, false);
-        self.sidebar_buffer.shape_until_scroll(&mut self.font_system, false);
-        self.tabs_buffer.shape_until_scroll(&mut self.font_system, false);
-        self.status_buffer.shape_until_scroll(&mut self.font_system, false);
-        self.terminal_buffer.shape_until_scroll(&mut self.font_system, false);
-        self.activity_buffer.shape_until_scroll(&mut self.font_system, false);
-        self.palette_buffer.shape_until_scroll(&mut self.font_system, false);
-        self.hover_buffer.shape_until_scroll(&mut self.font_system, false);
+        self.main_text_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        self.sidebar_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        self.tabs_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        self.status_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        self.terminal_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        self.activity_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        self.palette_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        self.hover_buffer
+            .shape_until_scroll(&mut self.font_system, false);
     }
-
     fn to_glyphon_color(&self, c: xcode_ui::Color) -> Color {
-        Color::rgba((c.r * 255.0) as u8, (c.g * 255.0) as u8, (c.b * 255.0) as u8, (c.a * 255.0) as u8)
+        Color::rgba(
+            (c.r * 255.0) as u8,
+            (c.g * 255.0) as u8,
+            (c.b * 255.0) as u8,
+            (c.a * 255.0) as u8,
+        )
     }
-
     pub fn handle_input(&mut self, event: &WindowEvent) -> bool {
         match event {
             WindowEvent::ModifiersChanged(m) => {
@@ -394,54 +571,78 @@ impl RenderState {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 match delta {
-                    MouseScrollDelta::LineDelta(_, y) => { self.target_scroll_offset = (self.target_scroll_offset - y * 40.0).max(0.0); }
-                    MouseScrollDelta::PixelDelta(pos) => { self.target_scroll_offset = (self.target_scroll_offset - pos.y as f32).max(0.0); }
+                    MouseScrollDelta::LineDelta(_, y) => {
+                        self.target_scroll_offset = (self.target_scroll_offset - y * 40.0).max(0.0);
+                    }
+                    MouseScrollDelta::PixelDelta(pos) => {
+                        self.target_scroll_offset =
+                            (self.target_scroll_offset - pos.y as f32).max(0.0);
+                    }
                 }
                 self.hover_open = false;
                 self.update_ui_buffers();
                 return true;
             }
-            WindowEvent::KeyboardInput { event: key_event, .. } => {
+            WindowEvent::KeyboardInput {
+                event: key_event, ..
+            } => {
                 if key_event.state == ElementState::Pressed {
-                    if self.modifiers.control_key() && self.modifiers.shift_key() && matches!(key_event.logical_key, Key::Character(ref c) if c == "p") {
+                    if self.modifiers.control_key()
+                        && self.modifiers.shift_key()
+                        && matches!(key_event.logical_key, Key::Character(ref c) if c == "p")
+                    {
                         self.palette_open = !self.palette_open;
                         self.palette_query.clear();
                         self.update_ui_buffers();
                         return true;
                     }
-
                     if self.palette_open {
                         match &key_event.logical_key {
-                            Key::Named(NamedKey::Escape) => { self.palette_open = false; }
-                            Key::Named(NamedKey::Backspace) => { self.palette_query.pop(); }
-                            Key::Named(NamedKey::Enter) => { self.palette_open = false; }
-                            Key::Character(text) => { if !text.chars().any(|c| c.is_control()) { self.palette_query.push_str(text); } }
+                            Key::Named(NamedKey::Escape) => {
+                                self.palette_open = false;
+                            }
+                            Key::Named(NamedKey::Backspace) => {
+                                self.palette_query.pop();
+                            }
+                            Key::Named(NamedKey::Enter) => {
+                                self.palette_open = false;
+                            }
+                            Key::Character(text) => {
+                                if !text.chars().any(|c| c.is_control()) {
+                                    self.palette_query.push_str(text);
+                                }
+                            }
                             _ => {}
                         }
                         self.update_ui_buffers();
                         return true;
                     }
-
-                    if self.hover_open && matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) {
-                         self.hover_open = false;
-                         self.update_ui_buffers();
-                         return true;
+                    if self.hover_open && matches!(key_event.logical_key, Key::Named(NamedKey::Escape))
+                    {
+                        self.hover_open = false;
+                        self.update_ui_buffers();
+                        return true;
                     }
-
-                    if self.modifiers.control_key() && matches!(key_event.logical_key, Key::Character(ref c) if c == "n") {
+                    if self.modifiers.control_key()
+                        && matches!(key_event.logical_key, Key::Character(ref c) if c == "n")
+                    {
                         self.workspace.open_editor(PathBuf::from("untitled"));
                         self.update_ui_buffers();
                         return true;
                     }
-                    
-                    if self.modifiers.control_key() && matches!(key_event.logical_key, Key::Character(ref c) if c == "s") {
+                    if self.modifiers.control_key()
+                        && matches!(key_event.logical_key, Key::Character(ref c) if c == "s")
+                    {
                         if let LayoutNode::Leaf(pane) = &self.workspace.root {
-                            if let PaneContent::Editor(editor) = &pane.content { let _ = editor.save(); }
+                            if let PaneContent::Editor(editor) = &pane.content {
+                                let _ = editor.save();
+                            }
                         }
                         return true;
                     }
-
-                    if self.modifiers.control_key() && matches!(key_event.logical_key, Key::Character(ref c) if c == "z") {
+                    if self.modifiers.control_key()
+                        && matches!(key_event.logical_key, Key::Character(ref c) if c == "z")
+                    {
                         if let LayoutNode::Leaf(pane) = &mut self.workspace.root {
                             if let PaneContent::Editor(editor) = &mut pane.content {
                                 editor.document.undo();
@@ -451,52 +652,97 @@ impl RenderState {
                         }
                         return true;
                     }
-
                     if matches!(key_event.logical_key, Key::Named(NamedKey::F12)) {
-                         let mut req_info = None;
-                         if let LayoutNode::Leaf(pane) = &self.workspace.root {
-                             if let PaneContent::Editor(editor) = &pane.content {
-                                 let (line, character) = editor.document.get_line_col(editor.cursor_pos);
-                                 req_info = Some((editor.path.display().to_string(), line, character));
-                             }
-                         }
-                         if let Some((path, line, character)) = req_info {
-                             if let Some(lsp) = &mut self.lsp { if let Ok(id) = lsp.goto_definition(&format!("file://{}", path), line, character) { self.pending_lsp_requests.push(id); } }
-                         }
-                         return true;
+                        let mut req_info = None;
+                        if let LayoutNode::Leaf(pane) = &self.workspace.root {
+                            if let PaneContent::Editor(editor) = &pane.content {
+                                let (line, character) =
+                                    editor.document.get_line_col(editor.cursor_pos);
+                                req_info = Some((editor.path.display().to_string(), line, character));
+                            }
+                        }
+                        if let Some((path, line, character)) = req_info {
+                            if let Some(lsp) = &mut self.lsp {
+                                if let Ok(id) = lsp.goto_definition(
+                                    &format!("file://{}", path),
+                                    line,
+                                    character,
+                                ) {
+                                    self.pending_lsp_requests.push(id);
+                                }
+                            }
+                        }
+                        return true;
                     }
-
-                    if self.modifiers.control_key() && matches!(key_event.logical_key, Key::Character(ref c) if c == "h") {
-                         let mut req_info = None;
-                         if let LayoutNode::Leaf(pane) = &self.workspace.root {
-                             if let PaneContent::Editor(editor) = &pane.content {
-                                 let (line, character) = editor.document.get_line_col(editor.cursor_pos);
-                                 req_info = Some((editor.path.display().to_string(), line, character));
-                             }
-                         }
-                         if let Some((path, line, character)) = req_info {
-                             if let Some(lsp) = &mut self.lsp { if let Ok(id) = lsp.hover(&format!("file://{}", path), line, character) { self.pending_lsp_requests.push(id); } }
-                         }
-                         return true;
+                    if self.modifiers.control_key()
+                        && matches!(key_event.logical_key, Key::Character(ref c) if c == "h")
+                    {
+                        let mut req_info = None;
+                        if let LayoutNode::Leaf(pane) = &self.workspace.root {
+                            if let PaneContent::Editor(editor) = &pane.content {
+                                let (line, character) =
+                                    editor.document.get_line_col(editor.cursor_pos);
+                                req_info = Some((editor.path.display().to_string(), line, character));
+                            }
+                        }
+                        if let Some((path, line, character)) = req_info {
+                            if let Some(lsp) = &mut self.lsp {
+                                if let Ok(id) =
+                                    lsp.hover(&format!("file://{}", path), line, character)
+                                {
+                                    self.pending_lsp_requests.push(id);
+                                }
+                            }
+                        }
+                        return true;
                     }
-
                     if let LayoutNode::Leaf(pane) = &mut self.workspace.root {
                         if let PaneContent::Editor(editor) = &mut pane.content {
                             let mut changed = false;
                             match &key_event.logical_key {
-                                Key::Named(NamedKey::Backspace) => { editor.document.delete_at_cursors(); changed = true; }
-                                Key::Named(NamedKey::ArrowLeft) => { for i in 0..editor.document.cursors.len() { editor.document.cursors[i].position = editor.document.find_prev_char_boundary(editor.document.cursors[i].position); } editor.cursor_pos = editor.document.cursors[0].position; }
-                                Key::Named(NamedKey::ArrowRight) => { for i in 0..editor.document.cursors.len() { editor.document.cursors[i].position = editor.document.find_next_char_boundary(editor.document.cursors[i].position); } editor.cursor_pos = editor.document.cursors[0].position; }
-                                Key::Named(NamedKey::Enter) => { editor.document.insert_at_cursors("\n"); changed = true; }
-                                Key::Named(NamedKey::Space) => { editor.document.insert_at_cursors(" "); changed = true; }
-                                Key::Character(text) => { if !text.chars().any(|c| c.is_control()) { editor.document.insert_at_cursors(text); changed = true; } }
+                                Key::Named(NamedKey::Backspace) => {
+                                    editor.document.delete_at_cursors();
+                                    changed = true;
+                                }
+                                Key::Named(NamedKey::ArrowLeft) => {
+                                    for i in 0..editor.document.cursors.len() {
+                                        editor.document.cursors[i].position = editor
+                                            .document
+                                            .find_prev_char_boundary(editor.document.cursors[i].position);
+                                    }
+                                    editor.cursor_pos = editor.document.cursors[0].position;
+                                }
+                                Key::Named(NamedKey::ArrowRight) => {
+                                    for i in 0..editor.document.cursors.len() {
+                                        editor.document.cursors[i].position = editor
+                                            .document
+                                            .find_next_char_boundary(editor.document.cursors[i].position);
+                                    }
+                                    editor.cursor_pos = editor.document.cursors[0].position;
+                                }
+                                Key::Named(NamedKey::Enter) => {
+                                    editor.document.insert_at_cursors("\n");
+                                    changed = true;
+                                }
+                                Key::Named(NamedKey::Space) => {
+                                    editor.document.insert_at_cursors(" ");
+                                    changed = true;
+                                }
+                                Key::Character(text) => {
+                                    if !text.chars().any(|c| c.is_control()) {
+                                        editor.document.insert_at_cursors(text);
+                                        changed = true;
+                                    }
+                                }
                                 _ => {}
                             }
                             if changed {
                                 let uri = format!("file://{}", editor.path.display());
                                 let content = editor.document.to_string();
                                 self.lsp_version += 1;
-                                if let Some(lsp) = &mut self.lsp { let _ = lsp.did_change(&uri, self.lsp_version, &content); }
+                                if let Some(lsp) = &mut self.lsp {
+                                    let _ = lsp.did_change(&uri, self.lsp_version, &content);
+                                }
                             }
                             self.hover_open = false;
                             self.update_ui_buffers();
@@ -509,77 +755,244 @@ impl RenderState {
         }
         false
     }
-
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size; self.config.width = new_size.width; self.config.height = new_size.height;
+            self.size = new_size;
+            self.config.width = new_size.width;
+            self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
-            self.viewport.update(&self.queue, Resolution { width: new_size.width, height: new_size.height });
+            self.viewport.update(
+                &self.queue,
+                Resolution {
+                    width: new_size.width,
+                    height: new_size.height,
+                },
+            );
             self.update_ui_buffers();
         }
     }
-
     pub fn render(&mut self) -> Result<(), &'static str> {
-        self.taffy.compute_layout(self.root_node, taffy::Size { width: taffy::AvailableSpace::Definite(self.size.width as f32), height: taffy::AvailableSpace::Definite(self.size.height as f32), }).unwrap();
+        self.taffy
+            .compute_layout(
+                self.root_node,
+                taffy::Size {
+                    width: taffy::AvailableSpace::Definite(self.size.width as f32),
+                    height: taffy::AvailableSpace::Definite(self.size.height as f32),
+                },
+            )
+            .unwrap();
         let activity_layout = *self.taffy.layout(self.activity_node).unwrap();
         let sidebar_layout = *self.taffy.layout(self.sidebar_node).unwrap();
         let tabs_layout = *self.taffy.layout(self.tabs_node).unwrap();
         let editor_layout = *self.taffy.layout(self.editor_node).unwrap();
         let terminal_layout = *self.taffy.layout(self.terminal_node).unwrap();
-
         self.update_ui_buffers();
-        let output = match self.surface.get_current_texture() { wgpu::CurrentSurfaceTexture::Success(texture) => texture, wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture, _ => return Err("Surface Error"), };
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Render Encoder") });
+        let output = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+            _ => return Err("Surface Error"),
+        };
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
         let mut vertices = Vec::new();
         let screen_width = self.size.width as f32;
         let screen_height = self.size.height as f32;
-
-        fn push_rect(vertices: &mut Vec<RectVertex>, x: f32, y: f32, w: f32, h: f32, c: xcode_ui::Color, sw: f32, sh: f32) {
-            let x1 = (x / sw) * 2.0 - 1.0; let y1 = 1.0 - (y / sh) * 2.0;
-            let x2 = ((x + w) / sw) * 2.0 - 1.0; let y2 = 1.0 - ((y + h) / sh) * 2.0;
-            let color = [c.r, c.g, c.b, c.a];
-            vertices.push(RectVertex { position: [x1, y1], color }); vertices.push(RectVertex { position: [x2, y1], color }); vertices.push(RectVertex { position: [x1, y2], color });
-            vertices.push(RectVertex { position: [x1, y2], color }); vertices.push(RectVertex { position: [x2, y1], color }); vertices.push(RectVertex { position: [x2, y2], color });
+        fn push_rect(
+            vertices: &mut Vec<RectVertex>,
+            x: f32,
+            y: f32,
+            w: f32,
+            h: f32,
+            c: xcode_ui::Color,
+            sw: f32,
+            sh: f32,
+            radius: f32,
+            opacity: f32,
+        ) {
+            let x1 = (x / sw) * 2.0 - 1.0;
+            let y1 = 1.0 - (y / sh) * 2.0;
+            let x2 = ((x + w) / sw) * 2.0 - 1.0;
+            let y2 = 1.0 - ((y + h) / sh) * 2.0;
+            let color = [c.r, c.g, c.b, c.a * opacity];
+            let rect_size = [w, h];
+            vertices.push(RectVertex {
+                position: [x1, y1],
+                color,
+                rect_pos: [-w / 2.0, h / 2.0],
+                rect_size,
+                corner_radius: radius,
+                border_width: 0.0,
+            });
+            vertices.push(RectVertex {
+                position: [x2, y1],
+                color,
+                rect_pos: [w / 2.0, h / 2.0],
+                rect_size,
+                corner_radius: radius,
+                border_width: 0.0,
+            });
+            vertices.push(RectVertex {
+                position: [x1, y2],
+                color,
+                rect_pos: [-w / 2.0, -h / 2.0],
+                rect_size,
+                corner_radius: radius,
+                border_width: 0.0,
+            });
+            vertices.push(RectVertex {
+                position: [x1, y2],
+                color,
+                rect_pos: [-w / 2.0, -h / 2.0],
+                rect_size,
+                corner_radius: radius,
+                border_width: 0.0,
+            });
+            vertices.push(RectVertex {
+                position: [x2, y1],
+                color,
+                rect_pos: [w / 2.0, h / 2.0],
+                rect_size,
+                corner_radius: radius,
+                border_width: 0.0,
+            });
+            vertices.push(RectVertex {
+                position: [x2, y2],
+                color,
+                rect_pos: [w / 2.0, -h / 2.0],
+                rect_size,
+                corner_radius: radius,
+                border_width: 0.0,
+            });
         }
-
-        push_rect(&mut vertices, activity_layout.location.x, activity_layout.location.y, activity_layout.size.width, activity_layout.size.height, self.theme.activity_bar_background, screen_width, screen_height);
-        push_rect(&mut vertices, sidebar_layout.location.x, sidebar_layout.location.y, sidebar_layout.size.width, sidebar_layout.size.height, self.theme.sidebar_background, screen_width, screen_height);
-
+        push_rect(
+            &mut vertices,
+            activity_layout.location.x,
+            activity_layout.location.y,
+            activity_layout.size.width,
+            activity_layout.size.height,
+            self.theme.activity_bar_background,
+            screen_width,
+            screen_height,
+            0.0,
+            1.0,
+        );
+        push_rect(
+            &mut vertices,
+            sidebar_layout.location.x,
+            sidebar_layout.location.y,
+            sidebar_layout.size.width,
+            sidebar_layout.size.height,
+            self.theme.sidebar_background,
+            screen_width,
+            screen_height,
+            0.0,
+            1.0,
+        );
         if let LayoutNode::Leaf(pane) = &self.workspace.root {
             if let PaneContent::Editor(editor) = &pane.content {
                 let show_cursor = (self.start_time.elapsed().as_millis() / 500) % 2 == 0;
-                let line_height = 20.0;
-                let char_width = 8.4;
+                let line_height = 19.0;
+                let char_width = 7.8;
                 let (active_line, active_col) = editor.document.get_line_col(editor.cursor_pos);
                 let start_line_visible = (self.current_scroll_offset / line_height) as usize;
                 let y_offset = self.current_scroll_offset % line_height;
                 if active_line >= start_line_visible {
-                     let y = editor_layout.location.y + ((active_line - start_line_visible) as f32 * line_height) - y_offset;
-                     push_rect(&mut vertices, editor_layout.location.x, y, editor_layout.size.width, line_height, self.theme.active_line_bg, screen_width, screen_height);
+                    let y = editor_layout.location.y
+                        + ((active_line - start_line_visible) as f32 * line_height)
+                        - y_offset;
+                    push_rect(
+                        &mut vertices,
+                        editor_layout.location.x,
+                        y,
+                        editor_layout.size.width,
+                        line_height,
+                        self.theme.active_line_bg,
+                        screen_width,
+                        screen_height,
+                        0.0,
+                        1.0,
+                    );
                 }
                 if show_cursor && active_line >= start_line_visible {
                     let x = editor_layout.location.x + 35.0 + (active_col as f32 * char_width);
-                    let y = editor_layout.location.y + ((active_line - start_line_visible) as f32 * line_height) - y_offset;
-                    push_rect(&mut vertices, x, y, 2.0, line_height, self.theme.cursor_color, screen_width, screen_height);
+                    let y = editor_layout.location.y
+                        + ((active_line - start_line_visible) as f32 * line_height)
+                        - y_offset;
+                    push_rect(
+                        &mut vertices,
+                        x,
+                        y,
+                        2.0,
+                        line_height,
+                        self.theme.cursor_color,
+                        screen_width,
+                        screen_height,
+                        1.0,
+                        1.0,
+                    );
                 }
             }
         }
-
-        if self.palette_open { push_rect(&mut vertices, screen_width / 2.0 - 200.0, 50.0, 400.0, 30.0, self.theme.activity_bar_background, screen_width, screen_height); }
-        if self.hover_open { push_rect(&mut vertices, screen_width / 2.0 - 150.0, screen_height / 2.0 - 100.0, 300.0, 200.0, self.theme.sidebar_background, screen_width, screen_height); }
-
+        if self.palette_anim > 0.0 {
+            push_rect(
+                &mut vertices,
+                screen_width / 2.0 - 200.0,
+                50.0 - (1.0 - self.palette_anim) * 20.0,
+                400.0,
+                30.0,
+                self.theme.activity_bar_background,
+                screen_width,
+                screen_height,
+                8.0,
+                self.palette_anim,
+            );
+        }
+        if self.hover_anim > 0.0 {
+            push_rect(
+                &mut vertices,
+                screen_width / 2.0 - 150.0,
+                screen_height / 2.0 - 100.0,
+                300.0,
+                200.0,
+                self.theme.sidebar_background,
+                screen_width,
+                screen_height,
+                12.0,
+                self.hover_anim,
+            );
+        }
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: self.theme.background.r as f64, g: self.theme.background.g as f64, b: self.theme.background.b as f64, a: 1.0 }), store: wgpu::StoreOp::Store, }, depth_slice: None,
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: self.theme.background.r as f64,
+                            g: self.theme.background.g as f64,
+                            b: self.theme.background.b as f64,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
                 })],
-                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
             });
-            self.rect_renderer.draw(&mut render_pass, &self.device, &vertices);
+            self.rect_renderer
+                .draw(&mut render_pass, &self.device, &vertices);
             let text_color = self.to_glyphon_color(self.theme.text_default);
-            let line_height = 20.0;
+            let line_height = 19.0;
             let y_offset = self.current_scroll_offset % line_height;
             let mut areas = vec![
                 TextArea { buffer: &self.activity_buffer, left: activity_layout.location.x, top: activity_layout.location.y, scale: 1.0, bounds: TextBounds { left: activity_layout.location.x as i32, top: activity_layout.location.y as i32, right: (activity_layout.location.x + activity_layout.size.width) as i32, bottom: (activity_layout.location.y + activity_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
@@ -589,10 +1002,52 @@ impl RenderState {
                 TextArea { buffer: &self.terminal_buffer, left: terminal_layout.location.x, top: terminal_layout.location.y, scale: 1.0, bounds: TextBounds { left: terminal_layout.location.x as i32, top: terminal_layout.location.y as i32, right: self.size.width as i32, bottom: (terminal_layout.location.y + terminal_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
                 TextArea { buffer: &self.status_buffer, left: 0.0, top: self.size.height as f32 - 20.0, scale: 1.0, bounds: TextBounds { left: 0, top: self.size.height as i32 - 20, right: self.size.width as i32, bottom: self.size.height as i32 }, default_color: text_color, custom_glyphs: &[] },
             ];
-            if self.palette_open { areas.push(TextArea { buffer: &self.palette_buffer, left: screen_width / 2.0 - 195.0, top: 53.0, scale: 1.0, bounds: TextBounds { left: (screen_width / 2.0 - 200.0) as i32, top: 50, right: (screen_width / 2.0 + 200.0) as i32, bottom: 80 }, default_color: text_color, custom_glyphs: &[] }); }
-            if self.hover_open { areas.push(TextArea { buffer: &self.hover_buffer, left: screen_width / 2.0 - 145.0, top: screen_height / 2.0 - 95.0, scale: 1.0, bounds: TextBounds { left: (screen_width / 2.0 - 150.0) as i32, top: (screen_height / 2.0 - 100.0) as i32, right: (screen_width / 2.0 + 150.0) as i32, bottom: (screen_height / 2.0 + 100.0) as i32 }, default_color: text_color, custom_glyphs: &[] }); }
-            self.text_renderer.prepare(&self.device, &self.queue, &mut self.font_system, &mut self.text_atlas, &self.viewport, areas, &mut self.swash_cache).unwrap();
-            self.text_renderer.render(&self.text_atlas, &self.viewport, &mut render_pass).unwrap();
+            if self.palette_anim > 0.0 {
+                areas.push(TextArea {
+                    buffer: &self.palette_buffer,
+                    left: screen_width / 2.0 - 195.0,
+                    top: 53.0 - (1.0 - self.palette_anim) * 20.0,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: (screen_width / 2.0 - 200.0) as i32,
+                        top: 0,
+                        right: (screen_width / 2.0 + 200.0) as i32,
+                        bottom: screen_height as i32,
+                    },
+                    default_color: text_color,
+                    custom_glyphs: &[],
+                });
+            }
+            if self.hover_anim > 0.0 {
+                areas.push(TextArea {
+                    buffer: &self.hover_buffer,
+                    left: screen_width / 2.0 - 145.0,
+                    top: screen_height / 2.0 - 95.0,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: (screen_width / 2.0 - 150.0) as i32,
+                        top: (screen_height / 2.0 - 100.0) as i32,
+                        right: (screen_width / 2.0 + 150.0) as i32,
+                        bottom: (screen_height / 2.0 + 100.0) as i32,
+                    },
+                    default_color: text_color,
+                    custom_glyphs: &[],
+                });
+            }
+            self.text_renderer
+                .prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.font_system,
+                    &mut self.text_atlas,
+                    &self.viewport,
+                    areas,
+                    &mut self.swash_cache,
+                )
+                .unwrap();
+            self.text_renderer
+                .render(&self.text_atlas, &self.viewport, &mut render_pass)
+                .unwrap();
         }
         self.text_atlas.trim();
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -602,9 +1057,52 @@ impl RenderState {
 }
 
 #[derive(Default)]
-struct App { state: Option<RenderState>, }
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) { if self.state.is_none() { let window_attributes = Window::default_attributes().with_title("Xcode"); let window = Arc::new(event_loop.create_window(window_attributes).unwrap()); let state = pollster::block_on(RenderState::new(window)); self.state = Some(state); } }
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) { let state = match self.state.as_mut() { Some(state) => state, None => return, }; if state.handle_input(&event) { state.window.request_redraw(); return; } match event { WindowEvent::CloseRequested | WindowEvent::KeyboardInput { event: KeyEvent { state: ElementState::Pressed, logical_key: Key::Named(NamedKey::Escape), .. }, .. } => event_loop.exit(), WindowEvent::Resized(physical_size) => { state.resize(physical_size); } WindowEvent::RedrawRequested => { let _ = state.render(); state.window.request_redraw(); } _ => {} } }
+struct App {
+    state: Option<RenderState>,
 }
-pub fn run() { env_logger::init(); let event_loop = EventLoop::new().unwrap(); let mut app = App::default(); event_loop.run_app(&mut app).unwrap(); }
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.is_none() {
+            let window_attributes = Window::default_attributes().with_title("Xcode");
+            let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
+            let state = pollster::block_on(RenderState::new(window));
+            self.state = Some(state);
+        }
+    }
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let state = match self.state.as_mut() {
+            Some(state) => state,
+            None => return,
+        };
+        if state.handle_input(&event) {
+            state.window.request_redraw();
+            return;
+        }
+        match event {
+            WindowEvent::CloseRequested
+            | WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        state: ElementState::Pressed,
+                        logical_key: Key::Named(NamedKey::Escape),
+                        ..
+                    },
+                ..
+            } => event_loop.exit(),
+            WindowEvent::Resized(physical_size) => {
+                state.resize(physical_size);
+            }
+            WindowEvent::RedrawRequested => {
+                let _ = state.render();
+                state.window.request_redraw();
+            }
+            _ => {}
+        }
+    }
+}
+pub fn run() {
+    env_logger::init();
+    let event_loop = EventLoop::new().unwrap();
+    let mut app = App::default();
+    event_loop.run_app(&mut app).unwrap();
+}

@@ -7,6 +7,10 @@ use bytemuck::{Pod, Zeroable};
 pub struct RectVertex {
     pub position: [f32; 2],
     pub color: [f32; 4],
+    pub rect_pos: [f32; 2],
+    pub rect_size: [f32; 2],
+    pub corner_radius: f32,
+    pub border_width: f32,
 }
 
 pub struct RectRenderer {
@@ -35,7 +39,14 @@ impl RectRenderer {
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<RectVertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4],
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x2,
+                        1 => Float32x4,
+                        2 => Float32x2,
+                        3 => Float32x2,
+                        4 => Float32,
+                        5 => Float32,
+                    ],
                 }],
                 compilation_options: Default::default(),
             },
