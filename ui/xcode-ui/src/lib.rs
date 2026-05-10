@@ -1,5 +1,7 @@
+#![deny(warnings)]
 use xcode_core::Document;
-use std::path::PathBuf;
+use std::path::{PathBuf};
+use taffy::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct EditorState {
@@ -67,11 +69,19 @@ pub struct FileItem {
 pub struct Workspace {
     pub root: LayoutNode,
     pub files: Vec<FileItem>,
+    pub taffy: TaffyTree<()>,
+    pub layout_root: NodeId,
     next_pane_id: usize,
 }
 
 impl Workspace {
     pub fn new_home() -> Self {
+        let mut taffy: TaffyTree<()> = TaffyTree::new();
+        let layout_root = taffy.new_leaf(Style {
+            size: Size { width: length(100.0), height: length(100.0) },
+            ..Default::default()
+        }).unwrap();
+
         let mut ws = Self {
             root: LayoutNode::Leaf(Pane {
                 content: PaneContent::Home,
@@ -79,6 +89,8 @@ impl Workspace {
                 id: 0,
             }),
             files: Vec::new(),
+            taffy,
+            layout_root,
             next_pane_id: 1,
         };
         ws.refresh_files();
@@ -95,7 +107,6 @@ impl Workspace {
                     .unwrap_or("?")
                     .to_string();
                 
-                // Skip hidden files
                 if name.starts_with('.') {
                     continue;
                 }
@@ -107,7 +118,6 @@ impl Workspace {
                 });
             }
         }
-        // Sort: directories first, then alphabetical
         self.files.sort_by(|a, b| {
             if a.is_dir != b.is_dir {
                 b.is_dir.cmp(&a.is_dir)
@@ -125,12 +135,5 @@ impl Workspace {
             id: self.next_pane_id,
         });
         self.next_pane_id += 1;
-    }
-
-    pub fn split(&mut self, _direction: SplitDirection) {
-        if let LayoutNode::Leaf(_pane) = &self.root {
-            // Placeholder for split logic
-            self.next_pane_id += 1;
-        }
     }
 }

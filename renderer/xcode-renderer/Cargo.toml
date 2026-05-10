@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+xcode-terminal = { path = "../../terminal/xcode-terminal" }
+xcode-services = { path = "../../services/xcode-services" }
+tree-sitter = "0.24.7"
+tree-sitter-rust = "0.23.2"
 env_logger = "0.11.10"
 glyphon = "0.11.0"
 log = "0.4.29"
