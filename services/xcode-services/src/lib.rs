@@ -60,11 +60,14 @@ struct JsonRpcRequest<T> {
     params: T,
 }
 
+use std::collections::HashMap;
+
 pub struct LspClient {
     _child: Child,
     stdin: std::process::ChildStdin,
     next_id: u64,
     responses: Arc<Mutex<Vec<serde_json::Value>>>,
+    pub diagnostics: Arc<Mutex<HashMap<String, Vec<serde_json::Value>>>>,
 }
 
 impl LspClient {
@@ -78,7 +81,10 @@ impl LspClient {
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let responses = Arc::new(Mutex::new(Vec::new()));
+        let diagnostics = Arc::new(Mutex::new(HashMap::new()));
+
         let responses_clone = responses.clone();
+        let diagnostics_clone = diagnostics.clone();
 
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -93,7 +99,19 @@ impl LspClient {
                         let mut body = vec![0u8; len];
                         if reader.read_exact(&mut body).is_ok() {
                             if let Ok(response) = serde_json::from_slice::<serde_json::Value>(&body) {
-                                responses_clone.lock().unwrap().push(response);
+                                if response.get("id").is_some() {
+                                    responses_clone.lock().unwrap().push(response);
+                                } else if let Some(method) = response.get("method") {
+                                    if method == "textDocument/publishDiagnostics" {
+                                        if let Some(params) = response.get("params") {
+                                            if let Some(uri) = params.get("uri").and_then(|u| u.as_str()) {
+                                                if let Some(diags) = params.get("diagnostics").and_then(|d| d.as_array()) {
+                                                    diagnostics_clone.lock().unwrap().insert(uri.to_string(), diags.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -106,6 +124,7 @@ impl LspClient {
             stdin,
             next_id: 1,
             responses,
+            diagnostics,
         })
     }
 
@@ -157,7 +176,8 @@ impl LspClient {
                 "textDocument": {
                     "hover": { "contentFormat": ["markdown", "plaintext"] },
                     "definition": { "dynamicRegistration": true },
-                    "synchronization": { "didSave": true, "dynamicRegistration": true }
+                    "synchronization": { "didSave": true, "dynamicRegistration": true },
+                    "completion": { "completionItem": { "snippetSupport": true } }
                 }
             }
         }))
@@ -193,6 +213,13 @@ impl LspClient {
 
     pub fn hover(&mut self, uri: &str, line: usize, character: usize) -> Result<u64> {
         self.send_request("textDocument/hover", serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character }
+        }))
+    }
+
+    pub fn completion(&mut self, uri: &str, line: usize, character: usize) -> Result<u64> {
+        self.send_request("textDocument/completion", serde_json::json!({
             "textDocument": { "uri": uri },
             "position": { "line": line, "character": character }
         }))

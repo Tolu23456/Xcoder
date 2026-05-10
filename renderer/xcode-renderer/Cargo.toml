@@ -18,3 +18,4 @@ wgpu = "29.0.3"
 winit = "0.30.13"
 xcode-core = { path = "../../core/xcode-core" }
 xcode-ui = { path = "../../ui/xcode-ui" }
+serde_json = "1.0.149"

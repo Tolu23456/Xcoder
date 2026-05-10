@@ -3068,6 +3068,7 @@ dependencies = [
  "glyphon",
  "log",
  "pollster",
+ "serde_json",
  "taffy",
  "tree-sitter",
  "tree-sitter-rust",

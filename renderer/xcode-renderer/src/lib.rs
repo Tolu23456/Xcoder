@@ -47,8 +47,10 @@ pub struct RenderState {
     status_buffer: Buffer,
     terminal_buffer: Buffer,
     activity_buffer: Buffer,
+    gutter_buffer: Buffer,
     palette_buffer: Buffer,
     hover_buffer: Buffer,
+    completion_buffer: Buffer,
 
     // Layout
     taffy: taffy::TaffyTree<()>,
@@ -57,12 +59,15 @@ pub struct RenderState {
     sidebar_node: NodeId,
     content_node: NodeId,
     tabs_node: NodeId,
+    gutter_node: NodeId,
     editor_node: NodeId,
+    editor_container_node: NodeId,
     terminal_node: NodeId,
     status_node: NodeId,
 
     // Workspace State
     workspace: xcode_ui::Workspace,
+    sidebar_selected_index: usize,
     modifiers: ModifiersState,
     theme: Theme,
 
@@ -75,6 +80,11 @@ pub struct RenderState {
     hover_open: bool,
     hover_text: String,
     hover_anim: f32,
+
+    // Autocompletion & Diagnostics
+    completion_open: bool,
+    completion_items: Vec<String>,
+    diagnostics: Vec<serde_json::Value>,
 
     // Services
     highlighter: SyntaxHighlighter,
@@ -187,8 +197,10 @@ impl RenderState {
         let status_buffer = Buffer::new(&mut font_system, Metrics::new(11.0, 18.0));
         let terminal_buffer = Buffer::new(&mut font_system, Metrics::new(12.0, 18.0));
         let activity_buffer = Buffer::new(&mut font_system, Metrics::new(18.0, 40.0));
+        let gutter_buffer = Buffer::new(&mut font_system, Metrics::new(13.0, 19.0));
         let palette_buffer = Buffer::new(&mut font_system, Metrics::new(13.0, 24.0));
         let hover_buffer = Buffer::new(&mut font_system, Metrics::new(12.0, 18.0));
+        let completion_buffer = Buffer::new(&mut font_system, Metrics::new(12.0, 18.0));
 
         let mut taffy: taffy::TaffyTree<()> = taffy::TaffyTree::new();
         let activity_node = taffy
@@ -221,14 +233,38 @@ impl RenderState {
             })
             .unwrap();
 
+        let gutter_node = taffy
+            .new_leaf(Style {
+                size: Size {
+                    width: length(40.0),
+                    height: percent(1.0),
+                },
+                ..Default::default()
+            })
+            .unwrap();
+
         let editor_node = taffy
             .new_leaf(Style {
                 size: Size {
                     width: percent(1.0),
-                    height: percent(0.65),
+                    height: percent(1.0),
                 },
                 ..Default::default()
             })
+            .unwrap();
+
+        let editor_container_node = taffy
+            .new_with_children(
+                Style {
+                    flex_direction: FlexDirection::Row,
+                    size: Size {
+                        width: percent(1.0),
+                        height: percent(0.65),
+                    },
+                    ..Default::default()
+                },
+                &[gutter_node, editor_node],
+            )
             .unwrap();
 
         let terminal_node = taffy
@@ -251,7 +287,7 @@ impl RenderState {
                     },
                     ..Default::default()
                 },
-                &[tabs_node, editor_node, terminal_node],
+                &[tabs_node, editor_container_node, terminal_node],
             )
             .unwrap();
 
@@ -304,18 +340,23 @@ impl RenderState {
             status_buffer,
             terminal_buffer,
             activity_buffer,
+            gutter_buffer,
             palette_buffer,
             hover_buffer,
+            completion_buffer,
             taffy,
             root_node,
             activity_node,
             sidebar_node,
             content_node,
             tabs_node,
+            gutter_node,
             editor_node,
+            editor_container_node,
             terminal_node,
             status_node,
             workspace,
+            sidebar_selected_index: 0,
             modifiers: ModifiersState::default(),
             theme: Theme::one_dark(),
             palette_open: false,
@@ -324,6 +365,9 @@ impl RenderState {
             hover_open: false,
             hover_text: String::new(),
             hover_anim: 0.0,
+            completion_open: false,
+            completion_items: Vec::new(),
+            diagnostics: Vec::new(),
             highlighter: SyntaxHighlighter::new(get_rust_lang()),
             terminal: TerminalEmulatorWrapper::new(),
             lsp,
@@ -353,6 +397,16 @@ impl RenderState {
             self.hover_anim = (self.hover_anim - 0.1).max(0.0);
         }
         if let Some(lsp) = &self.lsp {
+            if let LayoutNode::Leaf(pane) = &self.workspace.root {
+                if let PaneContent::Editor(editor) = &pane.content {
+                    let uri = format!("file://{}", editor.path.display());
+                    if let Ok(diags) = lsp.diagnostics.lock() {
+                        if let Some(file_diags) = diags.get(&uri) {
+                            self.diagnostics = file_diags.clone();
+                        }
+                    }
+                }
+            }
             let mut i = 0;
             while i < self.pending_lsp_requests.len() {
                 let id = self.pending_lsp_requests[i];
@@ -367,6 +421,15 @@ impl RenderState {
                             {
                                 self.workspace.open_editor(PathBuf::from(path_str));
                             }
+                        }
+                        if let Some(items) = result.get("items") {
+                            self.completion_items = items
+                                .as_array()
+                                .unwrap_or(&vec![])
+                                .iter()
+                                .map(|it| it["label"].as_str().unwrap_or("").to_string())
+                                .collect();
+                            self.completion_open = !self.completion_items.is_empty();
                         }
                         if let Some(contents) = result.get("contents") {
                             if let Some(value) = contents.get("value") {
@@ -385,9 +448,10 @@ impl RenderState {
             }
         }
         let mut sidebar_text = String::from(" PROJECT\n ───────\n");
-        for file in &self.workspace.files {
+        for (i, file) in self.workspace.files.iter().enumerate() {
             let icon = if file.is_dir { "📁" } else { "📄" };
-            sidebar_text.push_str(&format!(" {} {}\n", icon, file.name));
+            let prefix = if i == self.sidebar_selected_index { ">" } else { " " };
+            sidebar_text.push_str(&format!("{} {} {}\n", prefix, icon, file.name));
         }
         self.sidebar_buffer.set_text(
             &mut self.font_system,
@@ -396,6 +460,27 @@ impl RenderState {
             Shaping::Advanced,
             None,
         );
+        if let LayoutNode::Leaf(pane) = &self.workspace.root {
+            if let PaneContent::Editor(editor) = &pane.content {
+                let line_height = 19.0;
+                let visible_lines = (self.size.height as f32 / line_height) as usize + 2;
+                let start_line = (self.current_scroll_offset / line_height) as usize;
+                let end_line =
+                    (start_line + visible_lines).min(editor.document.buffer.line_count());
+                let mut gutter_text = String::new();
+                for i in start_line..end_line {
+                    gutter_text.push_str(&format!("{:>3}\n", i + 1));
+                }
+                let comment_color = self.to_glyphon_color(self.theme.comment);
+                self.gutter_buffer.set_text(
+                    &mut self.font_system,
+                    &gutter_text,
+                    &Attrs::new().family(Family::Monospace).color(comment_color),
+                    Shaping::Advanced,
+                    None,
+                );
+            }
+        }
         self.tabs_buffer.set_text(
             &mut self.font_system,
             "  main.rs  |  lib.rs  |  Cargo.toml  ",
@@ -461,6 +546,16 @@ impl RenderState {
             self.hover_buffer
                 .set_size(&mut self.font_system, Some(300.0), None);
         }
+        if self.completion_open {
+            let text = self.completion_items.join("\n");
+            self.completion_buffer.set_text(
+                &mut self.font_system,
+                &text,
+                &Attrs::new().family(Family::SansSerif),
+                Shaping::Advanced,
+                None,
+            );
+        }
         if let LayoutNode::Leaf(pane) = &self.workspace.root {
             match &pane.content {
                 PaneContent::Home => {
@@ -484,7 +579,7 @@ impl RenderState {
                     let mut visible_text = String::new();
                     for i in start_line..end_line {
                         if let Some(line) = editor.document.buffer.get_line(i) {
-                            visible_text.push_str(&format!("{:>3} │ {}", i + 1, line));
+                            visible_text.push_str(&line);
                             if !line.ends_with('\n') {
                                 visible_text.push('\n');
                             }
@@ -496,6 +591,8 @@ impl RenderState {
                     let text_default = self.to_glyphon_color(self.theme.text_default);
                     let keyword_color = self.to_glyphon_color(self.theme.keyword);
                     let function_color = self.to_glyphon_color(self.theme.function);
+                    let string_color = self.to_glyphon_color(self.theme.string);
+
                     for (start, end, kind) in highlights {
                         if start > last_idx {
                             rich_text.push((
@@ -513,6 +610,7 @@ impl RenderState {
                             | "i32" | "i64" | "i128" | "isize" | "f32" | "f64" | "str"
                             | "String" | "Vec" | "Option" | "Result" | "bool" | "true"
                             | "false" => function_color,
+                            "string" | "string_literal" | "char_literal" => string_color,
                             _ => text_default,
                         };
                         rich_text.push((
@@ -550,9 +648,13 @@ impl RenderState {
             .shape_until_scroll(&mut self.font_system, false);
         self.activity_buffer
             .shape_until_scroll(&mut self.font_system, false);
+        self.gutter_buffer
+            .shape_until_scroll(&mut self.font_system, false);
         self.palette_buffer
             .shape_until_scroll(&mut self.font_system, false);
         self.hover_buffer
+            .shape_until_scroll(&mut self.font_system, false);
+        self.completion_buffer
             .shape_until_scroll(&mut self.font_system, false);
     }
     fn to_glyphon_color(&self, c: xcode_ui::Color) -> Color {
@@ -596,6 +698,31 @@ impl RenderState {
                         self.update_ui_buffers();
                         return true;
                     }
+                    if !self.palette_open && !self.completion_open && !self.hover_open {
+                        match &key_event.logical_key {
+                            Key::Named(NamedKey::ArrowUp) if self.modifiers.alt_key() => {
+                                self.sidebar_selected_index = self.sidebar_selected_index.saturating_sub(1);
+                                self.update_ui_buffers();
+                                return true;
+                            }
+                            Key::Named(NamedKey::ArrowDown) if self.modifiers.alt_key() => {
+                                self.sidebar_selected_index = (self.sidebar_selected_index + 1).min(self.workspace.files.len().saturating_sub(1));
+                                self.update_ui_buffers();
+                                return true;
+                            }
+                            Key::Named(NamedKey::Enter) if self.modifiers.alt_key() => {
+                                if let Some(file) = self.workspace.files.get(self.sidebar_selected_index) {
+                                    if !file.is_dir {
+                                        let path = file.path.clone();
+                                        self.workspace.open_editor(path);
+                                        self.update_ui_buffers();
+                                    }
+                                }
+                                return true;
+                            }
+                            _ => {}
+                        }
+                    }
                     if self.palette_open {
                         match &key_event.logical_key {
                             Key::Named(NamedKey::Escape) => {
@@ -620,6 +747,19 @@ impl RenderState {
                     if self.hover_open && matches!(key_event.logical_key, Key::Named(NamedKey::Escape))
                     {
                         self.hover_open = false;
+                        self.update_ui_buffers();
+                        return true;
+                    }
+                    if self.completion_open {
+                        match &key_event.logical_key {
+                            Key::Named(NamedKey::Escape) => {
+                                self.completion_open = false;
+                            }
+                            Key::Named(NamedKey::Enter) => {
+                                self.completion_open = false;
+                            }
+                            _ => {}
+                        }
                         self.update_ui_buffers();
                         return true;
                     }
@@ -738,10 +878,14 @@ impl RenderState {
                             }
                             if changed {
                                 let uri = format!("file://{}", editor.path.display());
-                                let content = editor.document.to_string();
+                                let (line, character) =
+                                    editor.document.get_line_col(editor.cursor_pos);
                                 self.lsp_version += 1;
                                 if let Some(lsp) = &mut self.lsp {
-                                    let _ = lsp.did_change(&uri, self.lsp_version, &content);
+                                    let _ = lsp.did_change(&uri, self.lsp_version, &editor.document.to_string());
+                                    if let Ok(id) = lsp.completion(&uri, line, character) {
+                                        self.pending_lsp_requests.push(id);
+                                    }
                                 }
                             }
                             self.hover_open = false;
@@ -784,7 +928,9 @@ impl RenderState {
         let activity_layout = *self.taffy.layout(self.activity_node).unwrap();
         let sidebar_layout = *self.taffy.layout(self.sidebar_node).unwrap();
         let tabs_layout = *self.taffy.layout(self.tabs_node).unwrap();
+        let gutter_layout = *self.taffy.layout(self.gutter_node).unwrap();
         let editor_layout = *self.taffy.layout(self.editor_node).unwrap();
+        let editor_container_layout = *self.taffy.layout(self.editor_container_node).unwrap();
         let terminal_layout = *self.taffy.layout(self.terminal_node).unwrap();
         self.update_ui_buffers();
         let output = match self.surface.get_current_texture() {
@@ -884,6 +1030,18 @@ impl RenderState {
         );
         push_rect(
             &mut vertices,
+            gutter_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width,
+            gutter_layout.location.y + tabs_layout.size.height,
+            gutter_layout.size.width,
+            gutter_layout.size.height,
+            self.theme.activity_bar_background,
+            screen_width,
+            screen_height,
+            0.0,
+            1.0,
+        );
+        push_rect(
+            &mut vertices,
             sidebar_layout.location.x,
             sidebar_layout.location.y,
             sidebar_layout.size.width,
@@ -903,14 +1061,15 @@ impl RenderState {
                 let start_line_visible = (self.current_scroll_offset / line_height) as usize;
                 let y_offset = self.current_scroll_offset % line_height;
                 if active_line >= start_line_visible {
-                    let y = editor_layout.location.y
+                    let y = editor_container_layout.location.y
+                        + tabs_layout.size.height
                         + ((active_line - start_line_visible) as f32 * line_height)
                         - y_offset;
                     push_rect(
                         &mut vertices,
-                        editor_layout.location.x,
+                        editor_container_layout.location.x + sidebar_layout.size.width + sidebar_layout.location.x,
                         y,
-                        editor_layout.size.width,
+                        editor_container_layout.size.width,
                         line_height,
                         self.theme.active_line_bg,
                         screen_width,
@@ -920,8 +1079,9 @@ impl RenderState {
                     );
                 }
                 if show_cursor && active_line >= start_line_visible {
-                    let x = editor_layout.location.x + 35.0 + (active_col as f32 * char_width);
-                    let y = editor_layout.location.y
+                    let x = editor_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width + (active_col as f32 * char_width);
+                    let y = editor_container_layout.location.y
+                        + tabs_layout.size.height
                         + ((active_line - start_line_visible) as f32 * line_height)
                         - y_offset;
                     push_rect(
@@ -936,6 +1096,63 @@ impl RenderState {
                         1.0,
                         1.0,
                     );
+                }
+                if self.completion_open {
+                    let x = editor_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width + (active_col as f32 * char_width);
+                    let y = editor_container_layout.location.y
+                        + tabs_layout.size.height
+                        + ((active_line - start_line_visible) as f32 * line_height)
+                        - y_offset
+                        + line_height;
+                    push_rect(
+                        &mut vertices,
+                        x,
+                        y,
+                        200.0,
+                        100.0,
+                        self.theme.sidebar_background,
+                        screen_width,
+                        screen_height,
+                        4.0,
+                        1.0,
+                    );
+                }
+                // Draw Diagnostics (Underlines)
+                for diag in &self.diagnostics {
+                    if let Some(range) = diag.get("range").and_then(|r| r.as_object()) {
+                        let start_line = range["start"]["line"].as_u64().unwrap_or(0) as usize;
+                        let start_col = range["start"]["character"].as_u64().unwrap_or(0) as usize;
+                        let end_line = range["end"]["line"].as_u64().unwrap_or(0) as usize;
+                        let end_col = range["end"]["character"].as_u64().unwrap_or(0) as usize;
+
+                        let line_height = 19.0;
+                        let char_width = 7.8;
+                        let start_line_visible = (self.current_scroll_offset / line_height) as usize;
+                        let y_offset = self.current_scroll_offset % line_height;
+
+                        if start_line >= start_line_visible && start_line == end_line {
+                            let x = editor_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width + (start_col as f32 * char_width);
+                            let y = editor_container_layout.location.y
+                                + tabs_layout.size.height
+                                + ((start_line - start_line_visible) as f32 * line_height)
+                                - y_offset
+                                + line_height
+                                - 2.0;
+                            let width = (end_col - start_col) as f32 * char_width;
+                            push_rect(
+                                &mut vertices,
+                                x,
+                                y,
+                                width.max(4.0),
+                                2.0,
+                                xcode_ui::Color { r: 0.9, g: 0.1, b: 0.1, a: 1.0 },
+                                screen_width,
+                                screen_height,
+                                0.0,
+                                1.0,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -993,13 +1210,15 @@ impl RenderState {
                 .draw(&mut render_pass, &self.device, &vertices);
             let text_color = self.to_glyphon_color(self.theme.text_default);
             let line_height = 19.0;
+            let char_width = 7.8;
             let y_offset = self.current_scroll_offset % line_height;
             let mut areas = vec![
                 TextArea { buffer: &self.activity_buffer, left: activity_layout.location.x, top: activity_layout.location.y, scale: 1.0, bounds: TextBounds { left: activity_layout.location.x as i32, top: activity_layout.location.y as i32, right: (activity_layout.location.x + activity_layout.size.width) as i32, bottom: (activity_layout.location.y + activity_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
                 TextArea { buffer: &self.sidebar_buffer, left: sidebar_layout.location.x, top: sidebar_layout.location.y, scale: 1.0, bounds: TextBounds { left: sidebar_layout.location.x as i32, top: sidebar_layout.location.y as i32, right: (sidebar_layout.location.x + sidebar_layout.size.width) as i32, bottom: (sidebar_layout.location.y + sidebar_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
-                TextArea { buffer: &self.tabs_buffer, left: tabs_layout.location.x + sidebar_layout.location.x, top: tabs_layout.location.y, scale: 1.0, bounds: TextBounds { left: (tabs_layout.location.x + sidebar_layout.location.x) as i32, top: tabs_layout.location.y as i32, right: self.size.width as i32, bottom: (tabs_layout.location.y + tabs_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
-                TextArea { buffer: &self.main_text_buffer, left: editor_layout.location.x, top: editor_layout.location.y - y_offset, scale: 1.0, bounds: TextBounds { left: editor_layout.location.x as i32, top: editor_layout.location.y as i32, right: self.size.width as i32, bottom: (editor_layout.location.y + editor_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
-                TextArea { buffer: &self.terminal_buffer, left: terminal_layout.location.x, top: terminal_layout.location.y, scale: 1.0, bounds: TextBounds { left: terminal_layout.location.x as i32, top: terminal_layout.location.y as i32, right: self.size.width as i32, bottom: (terminal_layout.location.y + terminal_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
+                TextArea { buffer: &self.tabs_buffer, left: tabs_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width, top: tabs_layout.location.y, scale: 1.0, bounds: TextBounds { left: (tabs_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width) as i32, top: tabs_layout.location.y as i32, right: self.size.width as i32, bottom: (tabs_layout.location.y + tabs_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
+                TextArea { buffer: &self.gutter_buffer, left: gutter_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width, top: gutter_layout.location.y + tabs_layout.size.height - y_offset, scale: 1.0, bounds: TextBounds { left: (gutter_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width) as i32, top: (gutter_layout.location.y + tabs_layout.size.height) as i32, right: (gutter_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width) as i32, bottom: (gutter_layout.location.y + tabs_layout.size.height + gutter_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
+                TextArea { buffer: &self.main_text_buffer, left: editor_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width, top: editor_layout.location.y + tabs_layout.size.height - y_offset, scale: 1.0, bounds: TextBounds { left: (editor_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width) as i32, top: (editor_layout.location.y + tabs_layout.size.height) as i32, right: self.size.width as i32, bottom: (editor_layout.location.y + tabs_layout.size.height + editor_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
+                TextArea { buffer: &self.terminal_buffer, left: terminal_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width, top: terminal_layout.location.y + tabs_layout.size.height + editor_container_layout.size.height, scale: 1.0, bounds: TextBounds { left: (terminal_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width) as i32, top: (terminal_layout.location.y + tabs_layout.size.height + editor_container_layout.size.height) as i32, right: self.size.width as i32, bottom: self.size.height as i32 }, default_color: text_color, custom_glyphs: &[] },
                 TextArea { buffer: &self.status_buffer, left: 0.0, top: self.size.height as f32 - 20.0, scale: 1.0, bounds: TextBounds { left: 0, top: self.size.height as i32 - 20, right: self.size.width as i32, bottom: self.size.height as i32 }, default_color: text_color, custom_glyphs: &[] },
             ];
             if self.palette_anim > 0.0 {
@@ -1033,6 +1252,35 @@ impl RenderState {
                     default_color: text_color,
                     custom_glyphs: &[],
                 });
+            }
+            if self.completion_open {
+                if let LayoutNode::Leaf(pane) = &self.workspace.root {
+                    if let PaneContent::Editor(editor) = &pane.content {
+                        let (active_line, active_col) =
+                            editor.document.get_line_col(editor.cursor_pos);
+                        let start_line_visible = (self.current_scroll_offset / line_height) as usize;
+                        let x = editor_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width + (active_col as f32 * char_width);
+                        let y = editor_container_layout.location.y
+                            + tabs_layout.size.height
+                            + ((active_line - start_line_visible) as f32 * line_height)
+                            - y_offset
+                            + line_height;
+                        areas.push(TextArea {
+                            buffer: &self.completion_buffer,
+                            left: x + 5.0,
+                            top: y + 5.0,
+                            scale: 1.0,
+                            bounds: TextBounds {
+                                left: x as i32,
+                                top: y as i32,
+                                right: (x + 200.0) as i32,
+                                bottom: (y + 100.0) as i32,
+                            },
+                            default_color: text_color,
+                            custom_glyphs: &[],
+                        });
+                    }
+                }
             }
             self.text_renderer
                 .prepare(
