@@ -21,6 +21,13 @@ use winit::{
 use xcode_services::{get_rust_lang, LspClient, SyntaxHighlighter};
 use xcode_ui::{LayoutNode, PaneContent, Theme};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusedArea {
+    Sidebar,
+    Editor,
+    Terminal,
+}
+
 pub struct RenderState {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -49,6 +56,7 @@ pub struct RenderState {
     gutter_buffer: Buffer,
     palette_buffer: Buffer,
     hover_buffer: Buffer,
+    breadcrumb_buffer: Buffer,
     completion_buffer: Buffer,
 
     // Layout
@@ -58,6 +66,7 @@ pub struct RenderState {
     sidebar_node: NodeId,
     _content_node: NodeId,
     tabs_node: NodeId,
+    breadcrumb_node: NodeId,
     gutter_node: NodeId,
     editor_node: NodeId,
     editor_container_node: NodeId,
@@ -67,6 +76,7 @@ pub struct RenderState {
     // Workspace State
     workspace: xcode_ui::Workspace,
     sidebar_selected_index: usize,
+    focused_area: FocusedArea,
     modifiers: ModifiersState,
     theme: Theme,
 
@@ -201,6 +211,7 @@ impl RenderState {
         let gutter_buffer = Buffer::new(&mut font_system, Metrics::new(13.0, 19.0));
         let palette_buffer = Buffer::new(&mut font_system, Metrics::new(13.0, 24.0));
         let hover_buffer = Buffer::new(&mut font_system, Metrics::new(12.0, 18.0));
+        let breadcrumb_buffer = Buffer::new(&mut font_system, Metrics::new(11.0, 18.0));
         let completion_buffer = Buffer::new(&mut font_system, Metrics::new(12.0, 18.0));
 
         let mut taffy: taffy::TaffyTree<()> = taffy::TaffyTree::new();
@@ -229,6 +240,16 @@ impl RenderState {
                 size: Size {
                     width: percent(1.0),
                     height: length(32.0),
+                },
+                ..Default::default()
+            })
+            .unwrap();
+
+        let breadcrumb_node = taffy
+            .new_leaf(Style {
+                size: Size {
+                    width: percent(1.0),
+                    height: length(22.0),
                 },
                 ..Default::default()
             })
@@ -288,7 +309,7 @@ impl RenderState {
                     },
                     ..Default::default()
                 },
-                &[tabs_node, editor_container_node, terminal_node],
+                &[tabs_node, breadcrumb_node, editor_container_node, terminal_node],
             )
             .unwrap();
 
@@ -344,6 +365,7 @@ impl RenderState {
             gutter_buffer,
             palette_buffer,
             hover_buffer,
+            breadcrumb_buffer,
             completion_buffer,
             taffy,
             root_node,
@@ -351,6 +373,7 @@ impl RenderState {
             sidebar_node,
             _content_node: content_node,
             tabs_node,
+            breadcrumb_node,
             gutter_node,
             editor_node,
             editor_container_node,
@@ -358,6 +381,7 @@ impl RenderState {
             _status_node: status_node,
             workspace,
             sidebar_selected_index: 0,
+            focused_area: FocusedArea::Editor,
             modifiers: ModifiersState::default(),
             theme: Theme::one_dark(),
             palette_open: false,
@@ -482,11 +506,31 @@ impl RenderState {
                     Shaping::Advanced,
                     None,
                 );
+
+                let path_str = editor.path.display().to_string();
+                let breadcrumb = path_str.replace("/", " > ");
+                self.breadcrumb_buffer.set_text(
+                    &mut self.font_system,
+                    &format!("  {}", breadcrumb),
+                    &Attrs::new().family(Family::SansSerif).color(comment_color),
+                    Shaping::Advanced,
+                    None,
+                );
+            }
+        }
+        let mut tabs_text = String::new();
+        for (i, editor) in self.workspace.open_editors.iter().enumerate() {
+            let prefix = if Some(i) == self.workspace.active_editor_idx { "[ " } else { "  " };
+            let suffix = if Some(i) == self.workspace.active_editor_idx { " ]" } else { "  " };
+            let name = editor.path.file_name().and_then(|n| n.to_str()).unwrap_or("untitled");
+            tabs_text.push_str(&format!("{}{}{}", prefix, name, suffix));
+            if i < self.workspace.open_editors.len() - 1 {
+                tabs_text.push_str(" | ");
             }
         }
         self.tabs_buffer.set_text(
             &mut self.font_system,
-            "  main.rs  |  lib.rs  |  Cargo.toml  ",
+            &tabs_text,
             &Attrs::new().family(Family::SansSerif),
             Shaping::Advanced,
             None,
@@ -676,6 +720,8 @@ impl RenderState {
             .shape_until_scroll(&mut self.font_system, false);
         self.hover_buffer
             .shape_until_scroll(&mut self.font_system, false);
+        self.breadcrumb_buffer
+            .shape_until_scroll(&mut self.font_system, false);
         self.completion_buffer
             .shape_until_scroll(&mut self.font_system, false);
     }
@@ -711,6 +757,28 @@ impl RenderState {
                 event: key_event, ..
             } => {
                 if key_event.state == ElementState::Pressed {
+                    // Global Shortcuts (Focus Switching)
+                    if self.modifiers.control_key() {
+                        match &key_event.logical_key {
+                            Key::Character(c) if c == "1" => {
+                                self.focused_area = FocusedArea::Sidebar;
+                                self.update_ui_buffers();
+                                return true;
+                            }
+                            Key::Character(c) if c == "2" => {
+                                self.focused_area = FocusedArea::Editor;
+                                self.update_ui_buffers();
+                                return true;
+                            }
+                            Key::Character(c) if c == " " => {
+                                self.focused_area = FocusedArea::Terminal;
+                                self.update_ui_buffers();
+                                return true;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     if self.modifiers.control_key()
                         && self.modifiers.shift_key()
                         && matches!(key_event.logical_key, Key::Character(ref c) if c == "p")
@@ -720,31 +788,7 @@ impl RenderState {
                         self.update_ui_buffers();
                         return true;
                     }
-                    if !self.palette_open && !self.completion_open && !self.hover_open {
-                        match &key_event.logical_key {
-                            Key::Named(NamedKey::ArrowUp) if self.modifiers.alt_key() => {
-                                self.sidebar_selected_index = self.sidebar_selected_index.saturating_sub(1);
-                                self.update_ui_buffers();
-                                return true;
-                            }
-                            Key::Named(NamedKey::ArrowDown) if self.modifiers.alt_key() => {
-                                self.sidebar_selected_index = (self.sidebar_selected_index + 1).min(self.workspace.files.len().saturating_sub(1));
-                                self.update_ui_buffers();
-                                return true;
-                            }
-                            Key::Named(NamedKey::Enter) if self.modifiers.alt_key() => {
-                                if let Some(file) = self.workspace.files.get(self.sidebar_selected_index) {
-                                    if !file.is_dir {
-                                        let path = file.path.clone();
-                                        self.workspace.open_editor(path);
-                                        self.update_ui_buffers();
-                                    }
-                                }
-                                return true;
-                            }
-                            _ => {}
-                        }
-                    }
+
                     if self.palette_open {
                         match &key_event.logical_key {
                             Key::Named(NamedKey::Escape) => {
@@ -786,162 +830,254 @@ impl RenderState {
                         self.update_ui_buffers();
                         return true;
                     }
-                    if self.hover_open && matches!(key_event.logical_key, Key::Named(NamedKey::Escape))
-                    {
-                        self.hover_open = false;
-                        self.update_ui_buffers();
-                        return true;
-                    }
-                    if self.completion_open {
-                        match &key_event.logical_key {
-                            Key::Named(NamedKey::Escape) => {
-                                self.completion_open = false;
-                            }
-                            Key::Named(NamedKey::Enter) => {
-                                self.completion_open = false;
-                            }
-                            _ => {}
-                        }
-                        self.update_ui_buffers();
-                        return true;
-                    }
-                    if self.modifiers.control_key()
-                        && matches!(key_event.logical_key, Key::Character(ref c) if c == "n")
-                    {
-                        self.workspace.open_editor(PathBuf::from("untitled"));
-                        self.update_ui_buffers();
-                        return true;
-                    }
-                    if self.modifiers.control_key()
-                        && matches!(key_event.logical_key, Key::Character(ref c) if c == "s")
-                    {
-                        if let LayoutNode::Leaf(pane) = &self.workspace.root {
-                            if let PaneContent::Editor(editor) = &pane.content {
-                                let _ = editor.save();
-                            }
-                        }
-                        return true;
-                    }
-                    if self.modifiers.control_key()
-                        && matches!(key_event.logical_key, Key::Character(ref c) if c == "z")
-                    {
-                        if let LayoutNode::Leaf(pane) = &mut self.workspace.root {
-                            if let PaneContent::Editor(editor) = &mut pane.content {
-                                editor.document.undo();
-                                editor.cursor_pos = editor.document.cursors[0].position;
-                                self.update_ui_buffers();
-                            }
-                        }
-                        return true;
-                    }
-                    if matches!(key_event.logical_key, Key::Named(NamedKey::F12)) {
-                        let mut req_info = None;
-                        if let LayoutNode::Leaf(pane) = &self.workspace.root {
-                            if let PaneContent::Editor(editor) = &pane.content {
-                                let (line, character) =
-                                    editor.document.get_line_col(editor.cursor_pos);
-                                req_info = Some((editor.path.display().to_string(), line, character));
-                            }
-                        }
-                        if let Some((path, line, character)) = req_info {
-                            if let Some(lsp) = &mut self.lsp {
-                                if let Ok(id) = lsp.goto_definition(
-                                    &format!("file://{}", path),
-                                    line,
-                                    character,
-                                ) {
-                                    self.pending_lsp_requests.push(id);
-                                }
-                            }
-                        }
-                        return true;
-                    }
-                    if self.modifiers.control_key()
-                        && matches!(key_event.logical_key, Key::Character(ref c) if c == "h")
-                    {
-                        let mut req_info = None;
-                        if let LayoutNode::Leaf(pane) = &self.workspace.root {
-                            if let PaneContent::Editor(editor) = &pane.content {
-                                let (line, character) =
-                                    editor.document.get_line_col(editor.cursor_pos);
-                                req_info = Some((editor.path.display().to_string(), line, character));
-                            }
-                        }
-                        if let Some((path, line, character)) = req_info {
-                            if let Some(lsp) = &mut self.lsp {
-                                if let Ok(id) =
-                                    lsp.hover(&format!("file://{}", path), line, character)
-                                {
-                                    self.pending_lsp_requests.push(id);
-                                }
-                            }
-                        }
-                        return true;
-                    }
-                    if let LayoutNode::Leaf(pane) = &mut self.workspace.root {
-                        if let PaneContent::Editor(editor) = &mut pane.content {
-                            let mut changed = false;
-                            let mut lsp_changes = Vec::new();
+
+                    match self.focused_area {
+                        FocusedArea::Sidebar => {
                             match &key_event.logical_key {
-                                Key::Named(NamedKey::Backspace) => {
-                                    lsp_changes = editor.document.delete_at_cursors();
-                                    changed = true;
+                                Key::Named(NamedKey::ArrowUp) => {
+                                    self.sidebar_selected_index = self.sidebar_selected_index.saturating_sub(1);
+                                    self.update_ui_buffers();
+                                    return true;
                                 }
-                                Key::Named(NamedKey::ArrowLeft) => {
-                                    for i in 0..editor.document.cursors.len() {
-                                        editor.document.cursors[i].position = editor
-                                            .document
-                                            .find_prev_char_boundary(editor.document.cursors[i].position);
-                                    }
-                                    editor.cursor_pos = editor.document.cursors[0].position;
-                                }
-                                Key::Named(NamedKey::ArrowRight) => {
-                                    for i in 0..editor.document.cursors.len() {
-                                        editor.document.cursors[i].position = editor
-                                            .document
-                                            .find_next_char_boundary(editor.document.cursors[i].position);
-                                    }
-                                    editor.cursor_pos = editor.document.cursors[0].position;
+                                Key::Named(NamedKey::ArrowDown) => {
+                                    self.sidebar_selected_index = (self.sidebar_selected_index + 1).min(self.workspace.files.len().saturating_sub(1));
+                                    self.update_ui_buffers();
+                                    return true;
                                 }
                                 Key::Named(NamedKey::Enter) => {
-                                    lsp_changes = editor.document.insert_at_cursors("\n");
-                                    changed = true;
+                                    if let Some(file) = self.workspace.files.get(self.sidebar_selected_index) {
+                                        if !file.is_dir {
+                                            let path = file.path.clone();
+                                            self.workspace.open_editor(path);
+                                            self.focused_area = FocusedArea::Editor;
+                                            self.update_ui_buffers();
+                                        }
+                                    }
+                                    return true;
                                 }
-                                Key::Named(NamedKey::Space) => {
-                                    lsp_changes = editor.document.insert_at_cursors(" ");
-                                    changed = true;
+                                _ => {}
+                            }
+                        }
+                        FocusedArea::Editor => {
+                            if self.hover_open && matches!(key_event.logical_key, Key::Named(NamedKey::Escape))
+                            {
+                                self.hover_open = false;
+                                self.update_ui_buffers();
+                                return true;
+                            }
+                            if self.completion_open {
+                                match &key_event.logical_key {
+                                    Key::Named(NamedKey::Escape) => {
+                                        self.completion_open = false;
+                                    }
+                                    Key::Named(NamedKey::Enter) => {
+                                        self.completion_open = false;
+                                    }
+                                    _ => {}
                                 }
-                                Key::Character(text) => {
-                                    if !text.chars().any(|c| c.is_control()) {
-                                        lsp_changes = editor.document.insert_at_cursors(text);
-                                        changed = true;
+                                self.update_ui_buffers();
+                                return true;
+                            }
+                            if self.modifiers.control_key() {
+                                match &key_event.logical_key {
+                                    Key::Character(c) if c == "n" => {
+                                        self.workspace.open_editor(PathBuf::from("untitled"));
+                                        self.update_ui_buffers();
+                                        return true;
+                                    }
+                                    Key::Character(c) if c == "s" => {
+                                        if let LayoutNode::Leaf(pane) = &self.workspace.root {
+                                            if let PaneContent::Editor(editor) = &pane.content {
+                                                let _ = editor.save();
+                                            }
+                                        }
+                                        return true;
+                                    }
+                                    Key::Character(c) if c == "z" => {
+                                        if let LayoutNode::Leaf(pane) = &mut self.workspace.root {
+                                            if let PaneContent::Editor(editor) = &mut pane.content {
+                                                editor.document.undo();
+                                                editor.cursor_pos = editor.document.cursors[0].position;
+                                                self.text_cache.clear();
+                                                self.highlights_cache.clear();
+                                                self.update_ui_buffers();
+                                            }
+                                        }
+                                        return true;
+                                    }
+                                    Key::Character(c) if c == "w" => {
+                                        self.workspace.close_active_editor();
+                                        self.update_ui_buffers();
+                                        return true;
+                                    }
+                                    Key::Character(c) if c == "\\" => {
+                                        self.workspace.split(xcode_ui::SplitDirection::Horizontal);
+                                        self.update_ui_buffers();
+                                        return true;
+                                    }
+                                    Key::Character(c) if c == "-" => {
+                                        self.workspace.split(xcode_ui::SplitDirection::Vertical);
+                                        self.update_ui_buffers();
+                                        return true;
+                                    }
+                                    Key::Named(NamedKey::Tab) => {
+                                        if let Some(idx) = self.workspace.active_editor_idx {
+                                            let next_idx = (idx + 1) % self.workspace.open_editors.len().max(1);
+                                            if !self.workspace.open_editors.is_empty() {
+                                                let path = self.workspace.open_editors[next_idx].path.clone();
+                                                self.workspace.open_editor(path);
+                                                self.update_ui_buffers();
+                                            }
+                                        }
+                                        return true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+
+                            if matches!(key_event.logical_key, Key::Named(NamedKey::F12)) {
+                                let mut req_info = None;
+                                if let LayoutNode::Leaf(pane) = &self.workspace.root {
+                                    if let PaneContent::Editor(editor) = &pane.content {
+                                        let (line, character) =
+                                            editor.document.get_line_col(editor.cursor_pos);
+                                        req_info = Some((editor.path.display().to_string(), line, character));
+                                    }
+                                }
+                                if let Some((path, line, character)) = req_info {
+                                    if let Some(lsp) = &mut self.lsp {
+                                        if let Ok(id) = lsp.goto_definition(
+                                            &format!("file://{}", path),
+                                            line,
+                                            character,
+                                        ) {
+                                            self.pending_lsp_requests.push(id);
+                                        }
+                                    }
+                                }
+                                return true;
+                            }
+                            if self.modifiers.control_key()
+                                && matches!(key_event.logical_key, Key::Character(ref c) if c == "h")
+                            {
+                                let mut req_info = None;
+                                if let LayoutNode::Leaf(pane) = &self.workspace.root {
+                                    if let PaneContent::Editor(editor) = &pane.content {
+                                        let (line, character) =
+                                            editor.document.get_line_col(editor.cursor_pos);
+                                        req_info = Some((editor.path.display().to_string(), line, character));
+                                    }
+                                }
+                                if let Some((path, line, character)) = req_info {
+                                    if let Some(lsp) = &mut self.lsp {
+                                        if let Ok(id) =
+                                            lsp.hover(&format!("file://{}", path), line, character)
+                                        {
+                                            self.pending_lsp_requests.push(id);
+                                        }
+                                    }
+                                }
+                                return true;
+                            }
+                            if let LayoutNode::Leaf(pane) = &mut self.workspace.root {
+                                if let PaneContent::Editor(editor) = &mut pane.content {
+                                    let mut changed = false;
+                                    let mut lsp_changes = Vec::new();
+                                    match &key_event.logical_key {
+                                        Key::Named(NamedKey::Backspace) => {
+                                            lsp_changes = editor.document.delete_at_cursors();
+                                            changed = true;
+                                        }
+                                        Key::Named(NamedKey::ArrowLeft) => {
+                                            for i in 0..editor.document.cursors.len() {
+                                                editor.document.cursors[i].position = editor
+                                                    .document
+                                                    .find_prev_char_boundary(editor.document.cursors[i].position);
+                                            }
+                                            editor.cursor_pos = editor.document.cursors[0].position;
+                                        }
+                                        Key::Named(NamedKey::ArrowRight) => {
+                                            for i in 0..editor.document.cursors.len() {
+                                                editor.document.cursors[i].position = editor
+                                                    .document
+                                                    .find_next_char_boundary(editor.document.cursors[i].position);
+                                            }
+                                            editor.cursor_pos = editor.document.cursors[0].position;
+                                        }
+                                        Key::Named(NamedKey::Enter) => {
+                                            lsp_changes = editor.document.insert_at_cursors("\n");
+                                            changed = true;
+                                        }
+                                        Key::Named(NamedKey::Space) => {
+                                            lsp_changes = editor.document.insert_at_cursors(" ");
+                                            changed = true;
+                                        }
+                                        Key::Character(text) => {
+                                            if !text.chars().any(|c| c.is_control()) {
+                                                lsp_changes = editor.document.insert_at_cursors(text);
+                                                changed = true;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    if changed {
+                                        let uri = format!("file://{}", editor.path.display());
+                                        let (line, character) =
+                                            editor.document.get_line_col(editor.cursor_pos);
+                                        self.lsp_version += 1;
+                                        self.text_cache.clear();
+                                        self.highlights_cache.clear();
+                                        if let Some(lsp) = &mut self.lsp {
+                                            for (range, text) in lsp_changes {
+                                                let (start_line, start_col) = editor.document.get_line_col(range.start);
+                                                let (end_line, end_col) = editor.document.get_line_col(range.end);
+                                                let lsp_range = serde_json::json!({
+                                                    "start": { "line": start_line, "character": start_col },
+                                                    "end": { "line": end_line, "character": end_col }
+                                                });
+                                                let _ = lsp.did_change_incremental(&uri, self.lsp_version, lsp_range, &text);
+                                            }
+                                            if let Ok(id) = lsp.completion(&uri, line, character) {
+                                                self.pending_lsp_requests.push(id);
+                                            }
+                                        }
+                                    }
+                                    self.hover_open = false;
+                                    self.update_ui_buffers();
+                                    return true;
+                                }
+                            }
+                        }
+                        FocusedArea::Terminal => {
+                            if self.modifiers.control_key() {
+                                if let Key::Character(ref c) = key_event.logical_key {
+                                    if c == "c" {
+                                        self.terminal.inner.write("\x03");
+                                        self.update_ui_buffers();
+                                        return true;
+                                    }
+                                }
+                            }
+
+                            match &key_event.logical_key {
+                                Key::Character(c) => {
+                                    self.terminal.inner.write(c);
+                                }
+                                Key::Named(n) => {
+                                    match n {
+                                        NamedKey::Enter => self.terminal.inner.write("\r"),
+                                        NamedKey::Backspace => self.terminal.inner.write("\x7f"),
+                                        NamedKey::Tab => self.terminal.inner.write("\t"),
+                                        NamedKey::ArrowUp => self.terminal.inner.write("\x1b[A"),
+                                        NamedKey::ArrowDown => self.terminal.inner.write("\x1b[B"),
+                                        NamedKey::ArrowRight => self.terminal.inner.write("\x1b[C"),
+                                        NamedKey::ArrowLeft => self.terminal.inner.write("\x1b[D"),
+                                        NamedKey::Escape => self.terminal.inner.write("\x1b"),
+                                        _ => {}
                                     }
                                 }
                                 _ => {}
                             }
-                            if changed {
-                                let uri = format!("file://{}", editor.path.display());
-                                let (line, character) =
-                                    editor.document.get_line_col(editor.cursor_pos);
-                                self.lsp_version += 1;
-                                self.text_cache.clear();
-                                self.highlights_cache.clear();
-                                if let Some(lsp) = &mut self.lsp {
-                                    for (range, text) in lsp_changes {
-                                        let (start_line, start_col) = editor.document.get_line_col(range.start);
-                                        let (end_line, end_col) = editor.document.get_line_col(range.end);
-                                        let lsp_range = serde_json::json!({
-                                            "start": { "line": start_line, "character": start_col },
-                                            "end": { "line": end_line, "character": end_col }
-                                        });
-                                        let _ = lsp.did_change_incremental(&uri, self.lsp_version, lsp_range, &text);
-                                    }
-                                    if let Ok(id) = lsp.completion(&uri, line, character) {
-                                        self.pending_lsp_requests.push(id);
-                                    }
-                                }
-                            }
-                            self.hover_open = false;
                             self.update_ui_buffers();
                             return true;
                         }
@@ -981,6 +1117,7 @@ impl RenderState {
         let activity_layout = *self.taffy.layout(self.activity_node).unwrap();
         let sidebar_layout = *self.taffy.layout(self.sidebar_node).unwrap();
         let tabs_layout = *self.taffy.layout(self.tabs_node).unwrap();
+        let breadcrumb_layout = *self.taffy.layout(self.breadcrumb_node).unwrap();
         let gutter_layout = *self.taffy.layout(self.gutter_node).unwrap();
         let editor_layout = *self.taffy.layout(self.editor_node).unwrap();
         let editor_container_layout = *self.taffy.layout(self.editor_container_node).unwrap();
@@ -1084,7 +1221,7 @@ impl RenderState {
         push_rect(
             &mut vertices,
             gutter_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width,
-            gutter_layout.location.y + tabs_layout.size.height,
+            gutter_layout.location.y + tabs_layout.size.height + breadcrumb_layout.size.height,
             gutter_layout.size.width,
             gutter_layout.size.height,
             self.theme.activity_bar_background,
@@ -1105,9 +1242,24 @@ impl RenderState {
             0.0,
             1.0,
         );
+
+        // Draw Focus Indicators
+        let focus_color = self.theme.cursor_color;
+        match self.focused_area {
+            FocusedArea::Sidebar => {
+                push_rect(&mut vertices, sidebar_layout.location.x + sidebar_layout.size.width - 2.0, sidebar_layout.location.y, 2.0, sidebar_layout.size.height, focus_color, screen_width, screen_height, 0.0, 1.0);
+            }
+            FocusedArea::Editor => {
+                push_rect(&mut vertices, editor_container_layout.location.x + sidebar_layout.size.width + sidebar_layout.location.x, editor_container_layout.location.y + tabs_layout.size.height, editor_container_layout.size.width, 2.0, focus_color, screen_width, screen_height, 0.0, 1.0);
+            }
+            FocusedArea::Terminal => {
+                push_rect(&mut vertices, terminal_layout.location.x + sidebar_layout.size.width + sidebar_layout.location.x, terminal_layout.location.y + tabs_layout.size.height + breadcrumb_layout.size.height + editor_container_layout.size.height, terminal_layout.size.width, 2.0, focus_color, screen_width, screen_height, 0.0, 1.0);
+            }
+        }
+
         if let LayoutNode::Leaf(pane) = &self.workspace.root {
             if let PaneContent::Editor(editor) = &pane.content {
-                let show_cursor = (self.start_time.elapsed().as_millis() / 500) % 2 == 0;
+                let show_cursor = (self.start_time.elapsed().as_millis() / 500) % 2 == 0 && self.focused_area == FocusedArea::Editor;
                 let line_height = 19.0;
                 let char_width = 7.8;
                 let (active_line, active_col) = editor.document.get_line_col(editor.cursor_pos);
@@ -1116,6 +1268,7 @@ impl RenderState {
                 if active_line >= start_line_visible {
                     let y = editor_container_layout.location.y
                         + tabs_layout.size.height
+                        + breadcrumb_layout.size.height
                         + ((active_line - start_line_visible) as f32 * line_height)
                         - y_offset;
                     push_rect(
@@ -1131,29 +1284,36 @@ impl RenderState {
                         1.0,
                     );
                 }
-                if show_cursor && active_line >= start_line_visible {
-                    let x = editor_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width + (active_col as f32 * char_width);
-                    let y = editor_container_layout.location.y
-                        + tabs_layout.size.height
-                        + ((active_line - start_line_visible) as f32 * line_height)
-                        - y_offset;
-                    push_rect(
-                        &mut vertices,
-                        x,
-                        y,
-                        2.0,
-                        line_height,
-                        self.theme.cursor_color,
-                        screen_width,
-                        screen_height,
-                        1.0,
-                        1.0,
-                    );
+                if show_cursor {
+                    for cursor in &editor.document.cursors {
+                        let (c_line, c_col) = editor.document.get_line_col(cursor.position);
+                        if c_line >= start_line_visible {
+                            let x = editor_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width + (c_col as f32 * char_width);
+                            let y = editor_container_layout.location.y
+                                + tabs_layout.size.height
+                                + breadcrumb_layout.size.height
+                                + ((c_line - start_line_visible) as f32 * line_height)
+                                - y_offset;
+                            push_rect(
+                                &mut vertices,
+                                x,
+                                y,
+                                2.0,
+                                line_height,
+                                self.theme.cursor_color,
+                                screen_width,
+                                screen_height,
+                                1.0,
+                                1.0,
+                            );
+                        }
+                    }
                 }
                 if self.completion_open {
                     let x = editor_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width + (active_col as f32 * char_width);
                     let y = editor_container_layout.location.y
                         + tabs_layout.size.height
+                        + breadcrumb_layout.size.height
                         + ((active_line - start_line_visible) as f32 * line_height)
                         - y_offset
                         + line_height;
@@ -1187,6 +1347,7 @@ impl RenderState {
                             let x = editor_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width + (start_col as f32 * char_width);
                             let y = editor_container_layout.location.y
                                 + tabs_layout.size.height
+                                + breadcrumb_layout.size.height
                                 + ((start_line - start_line_visible) as f32 * line_height)
                                 - y_offset
                                 + line_height
@@ -1269,9 +1430,10 @@ impl RenderState {
                 TextArea { buffer: &self.activity_buffer, left: activity_layout.location.x, top: activity_layout.location.y, scale: 1.0, bounds: TextBounds { left: activity_layout.location.x as i32, top: activity_layout.location.y as i32, right: (activity_layout.location.x + activity_layout.size.width) as i32, bottom: (activity_layout.location.y + activity_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
                 TextArea { buffer: &self.sidebar_buffer, left: sidebar_layout.location.x, top: sidebar_layout.location.y, scale: 1.0, bounds: TextBounds { left: sidebar_layout.location.x as i32, top: sidebar_layout.location.y as i32, right: (sidebar_layout.location.x + sidebar_layout.size.width) as i32, bottom: (sidebar_layout.location.y + sidebar_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
                 TextArea { buffer: &self.tabs_buffer, left: tabs_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width, top: tabs_layout.location.y, scale: 1.0, bounds: TextBounds { left: (tabs_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width) as i32, top: tabs_layout.location.y as i32, right: self.size.width as i32, bottom: (tabs_layout.location.y + tabs_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
-                TextArea { buffer: &self.gutter_buffer, left: gutter_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width, top: gutter_layout.location.y + tabs_layout.size.height - y_offset, scale: 1.0, bounds: TextBounds { left: (gutter_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width) as i32, top: (gutter_layout.location.y + tabs_layout.size.height) as i32, right: (gutter_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width) as i32, bottom: (gutter_layout.location.y + tabs_layout.size.height + gutter_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
-                TextArea { buffer: &self.main_text_buffer, left: editor_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width, top: editor_layout.location.y + tabs_layout.size.height - y_offset, scale: 1.0, bounds: TextBounds { left: (editor_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width) as i32, top: (editor_layout.location.y + tabs_layout.size.height) as i32, right: self.size.width as i32, bottom: (editor_layout.location.y + tabs_layout.size.height + editor_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
-                TextArea { buffer: &self.terminal_buffer, left: terminal_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width, top: terminal_layout.location.y + tabs_layout.size.height + editor_container_layout.size.height, scale: 1.0, bounds: TextBounds { left: (terminal_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width) as i32, top: (terminal_layout.location.y + tabs_layout.size.height + editor_container_layout.size.height) as i32, right: self.size.width as i32, bottom: self.size.height as i32 }, default_color: text_color, custom_glyphs: &[] },
+                TextArea { buffer: &self.breadcrumb_buffer, left: breadcrumb_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width, top: breadcrumb_layout.location.y + tabs_layout.size.height, scale: 1.0, bounds: TextBounds { left: (breadcrumb_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width) as i32, top: (breadcrumb_layout.location.y + tabs_layout.size.height) as i32, right: self.size.width as i32, bottom: (breadcrumb_layout.location.y + tabs_layout.size.height + breadcrumb_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
+                TextArea { buffer: &self.gutter_buffer, left: gutter_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width, top: gutter_layout.location.y + tabs_layout.size.height + breadcrumb_layout.size.height - y_offset, scale: 1.0, bounds: TextBounds { left: (gutter_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width) as i32, top: (gutter_layout.location.y + tabs_layout.size.height + breadcrumb_layout.size.height) as i32, right: (gutter_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width) as i32, bottom: (gutter_layout.location.y + tabs_layout.size.height + breadcrumb_layout.size.height + gutter_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
+                TextArea { buffer: &self.main_text_buffer, left: editor_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width, top: editor_layout.location.y + tabs_layout.size.height + breadcrumb_layout.size.height - y_offset, scale: 1.0, bounds: TextBounds { left: (editor_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width) as i32, top: (editor_layout.location.y + tabs_layout.size.height + breadcrumb_layout.size.height) as i32, right: self.size.width as i32, bottom: (editor_layout.location.y + tabs_layout.size.height + breadcrumb_layout.size.height + editor_layout.size.height) as i32 }, default_color: text_color, custom_glyphs: &[] },
+                TextArea { buffer: &self.terminal_buffer, left: terminal_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width, top: terminal_layout.location.y + tabs_layout.size.height + breadcrumb_layout.size.height + editor_container_layout.size.height, scale: 1.0, bounds: TextBounds { left: (terminal_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width) as i32, top: (terminal_layout.location.y + tabs_layout.size.height + breadcrumb_layout.size.height + editor_container_layout.size.height) as i32, right: self.size.width as i32, bottom: self.size.height as i32 }, default_color: text_color, custom_glyphs: &[] },
                 TextArea { buffer: &self.status_buffer, left: 0.0, top: self.size.height as f32 - 20.0, scale: 1.0, bounds: TextBounds { left: 0, top: self.size.height as i32 - 20, right: self.size.width as i32, bottom: self.size.height as i32 }, default_color: text_color, custom_glyphs: &[] },
             ];
             if self.palette_anim > 0.0 {
@@ -1315,6 +1477,7 @@ impl RenderState {
                         let x = editor_layout.location.x + sidebar_layout.location.x + sidebar_layout.size.width + gutter_layout.size.width + (active_col as f32 * char_width);
                         let y = editor_container_layout.location.y
                             + tabs_layout.size.height
+                            + breadcrumb_layout.size.height
                             + ((active_line - start_line_visible) as f32 * line_height)
                             - y_offset
                             + line_height;

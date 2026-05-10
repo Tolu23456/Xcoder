@@ -39,7 +39,14 @@ impl TerminalEmulator {
             pixel_height: 0,
         }).unwrap();
 
-        let cmd = CommandBuilder::new("sh");
+        let shell_owned;
+        let shell = if cfg!(target_os = "windows") {
+            "powershell.exe"
+        } else {
+            shell_owned = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+            &shell_owned
+        };
+        let cmd = CommandBuilder::new(shell);
         let _child = pair.slave.spawn_command(cmd).unwrap();
 
         let mut reader = pair.master.try_clone_reader().unwrap();

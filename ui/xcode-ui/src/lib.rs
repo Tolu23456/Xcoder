@@ -94,6 +94,7 @@ impl EditorState {
     }
 }
 
+#[derive(Clone)]
 pub enum PaneContent {
     Editor(EditorState),
     Terminal,
@@ -106,6 +107,7 @@ pub struct Pane {
     pub id: usize,
 }
 
+#[derive(Clone, Copy)]
 pub enum SplitDirection {
     Horizontal,
     Vertical,
@@ -131,6 +133,8 @@ pub struct FileItem {
 pub struct Workspace {
     pub root: LayoutNode,
     pub files: Vec<FileItem>,
+    pub open_editors: Vec<EditorState>,
+    pub active_editor_idx: Option<usize>,
     pub taffy: TaffyTree<()>,
     pub layout_root: NodeId,
     next_pane_id: usize,
@@ -151,6 +155,8 @@ impl Workspace {
                 id: 0,
             }),
             files: Vec::new(),
+            open_editors: Vec::new(),
+            active_editor_idx: None,
             taffy,
             layout_root,
             next_pane_id: 1,
@@ -190,12 +196,110 @@ impl Workspace {
     }
 
     pub fn open_editor(&mut self, path: PathBuf) {
-        let editor = EditorState::new(path);
-        self.root = LayoutNode::Leaf(Pane {
-            content: PaneContent::Editor(editor),
-            focused: true,
-            id: self.next_pane_id,
-        });
+        if let Some(pos) = self.open_editors.iter().position(|e| e.path == path) {
+            self.active_editor_idx = Some(pos);
+        } else {
+            let editor = EditorState::new(path);
+            self.open_editors.push(editor.clone());
+            self.active_editor_idx = Some(self.open_editors.len() - 1);
+        }
+
+        if let Some(idx) = self.active_editor_idx {
+            let editor = self.open_editors[idx].clone();
+            // Update the focused leaf node in the layout tree
+            self.update_active_pane_content(PaneContent::Editor(editor));
+        }
         self.next_pane_id += 1;
+    }
+
+    fn update_active_pane_content(&mut self, content: PaneContent) {
+        fn recurse(node: &mut LayoutNode, content: PaneContent) -> bool {
+            match node {
+                LayoutNode::Leaf(pane) if pane.focused => {
+                    pane.content = content;
+                    true
+                }
+                LayoutNode::Split { first, second, .. } => {
+                    recurse(first, content.clone()) || recurse(second, content)
+                }
+                _ => false,
+            }
+        }
+        if !recurse(&mut self.root, content.clone()) {
+            // If no pane is focused, just replace root for now (fallback)
+            if let PaneContent::Editor(editor) = content {
+               self.root = LayoutNode::Leaf(Pane {
+                   content: PaneContent::Editor(editor),
+                   focused: true,
+                   id: 0,
+               });
+            }
+        }
+    }
+
+    pub fn split(&mut self, direction: SplitDirection) {
+        fn recurse(node: &mut LayoutNode, direction: SplitDirection, next_id: &mut usize) -> Option<LayoutNode> {
+            match node {
+                LayoutNode::Leaf(pane) if pane.focused => {
+                    let first = LayoutNode::Leaf(Pane {
+                        content: pane.content.clone(),
+                        focused: true,
+                        id: pane.id,
+                    });
+                    let second = LayoutNode::Leaf(Pane {
+                        content: pane.content.clone(), // Duplicate for now
+                        focused: false,
+                        id: *next_id,
+                    });
+                    *next_id += 1;
+                    Some(LayoutNode::Split {
+                        direction,
+                        ratio: 0.5,
+                        first: Box::new(first),
+                        second: Box::new(second),
+                    })
+                }
+                LayoutNode::Split { first, second, .. } => {
+                    if let Some(new_first) = recurse(first, direction, next_id) {
+                        *first = Box::new(new_first);
+                        None
+                    } else if let Some(new_second) = recurse(second, direction, next_id) {
+                        *second = Box::new(new_second);
+                        None
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
+        let mut next_id = self.next_pane_id;
+        if let Some(new_root) = recurse(&mut self.root, direction, &mut next_id) {
+            self.root = new_root;
+        }
+        self.next_pane_id = next_id;
+    }
+
+    pub fn close_active_editor(&mut self) {
+        if let Some(idx) = self.active_editor_idx {
+            self.open_editors.remove(idx);
+            if self.open_editors.is_empty() {
+                self.active_editor_idx = None;
+                self.root = LayoutNode::Leaf(Pane {
+                    content: PaneContent::Home,
+                    focused: true,
+                    id: 0,
+                });
+            } else {
+                let new_idx = idx.min(self.open_editors.len() - 1);
+                self.active_editor_idx = Some(new_idx);
+                let editor = self.open_editors[new_idx].clone();
+                self.root = LayoutNode::Leaf(Pane {
+                    content: PaneContent::Editor(editor),
+                    focused: true,
+                    id: self.next_pane_id,
+                });
+            }
+        }
     }
 }

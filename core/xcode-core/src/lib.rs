@@ -305,14 +305,41 @@ impl PieceTable {
         let query_text = if case_sensitive { query.to_string() } else { query.to_lowercase() };
         if query_text.is_empty() { return results; }
 
-        let content = self.collect_content();
-        let search_text = if case_sensitive { content } else { content.to_lowercase() };
+        let mut current_offset = 0;
+        let mut overlap_buffer = String::new();
+        let query_len = query.len();
 
-        let mut start = 0;
-        while let Some(pos) = search_text[start..].find(&query_text) {
-            let actual_pos = start + pos;
-            results.push(actual_pos..actual_pos + query.len());
-            start = actual_pos + query.len().max(1);
+        for piece in &self.pieces {
+            let source_str = match piece.source {
+                Source::Original => &self.original,
+                Source::Added => &self.added,
+            };
+            let piece_text = &source_str[piece.start..piece.start + piece.length];
+            let mut search_segment = if case_sensitive {
+                piece_text.to_string()
+            } else {
+                piece_text.to_lowercase()
+            };
+
+            // Prepend overlap from previous piece
+            let overlap_len = overlap_buffer.len();
+            if overlap_len > 0 {
+                search_segment = overlap_buffer.clone() + &search_segment;
+            }
+
+            let mut start = 0;
+            while let Some(pos) = search_segment[start..].find(&query_text) {
+                let segment_pos = start + pos;
+                let actual_pos = (current_offset + segment_pos).saturating_sub(overlap_len);
+                results.push(actual_pos..actual_pos + query_len);
+                start = segment_pos + query_len.max(1);
+            }
+
+            // Save end of current piece for next overlap (up to query_len - 1)
+            let next_overlap_start = search_segment.len().saturating_sub(query_len.saturating_sub(1));
+            overlap_buffer = search_segment[next_overlap_start..].to_string();
+
+            current_offset += piece.length;
         }
         results
     }
@@ -357,18 +384,30 @@ impl PieceTable {
         let mut current_line = 0;
         let mut current_offset = 0;
         for piece in &self.pieces {
-            if current_offset + piece.length >= pos {
+            let piece_end = current_offset + piece.length;
+            if pos <= piece_end {
+                let offset_in_piece = pos - current_offset;
                 let source_str = match piece.source {
                     Source::Original => &self.original,
                     Source::Added => &self.added,
                 };
-                let offset_in_piece = pos - current_offset;
-                let piece_text = &source_str[piece.start..piece.start + offset_in_piece];
-                let line_in_piece = piece_text.chars().filter(|&c| c == '\n').count();
-                let col = if line_in_piece > 0 {
-                    piece_text.chars().rev().take_while(|&c| c != '\n').count()
+
+                // Use line_starts index for faster calculation
+                let mut lines_before = 0;
+                let mut last_line_start = 0;
+                for &ls in &piece.line_starts {
+                    if ls <= offset_in_piece {
+                        lines_before += 1;
+                        last_line_start = ls;
+                    } else {
+                        break;
+                    }
+                }
+
+                let col = if lines_before > 0 {
+                    source_str[piece.start + last_line_start..piece.start + offset_in_piece].chars().count()
                 } else {
-                    let mut c = piece_text.chars().count();
+                    let mut c = source_str[piece.start..piece.start + offset_in_piece].chars().count();
                     let mut p_idx = self.pieces.iter().position(|p| p as *const _ == piece as *const _).unwrap();
                     while p_idx > 0 {
                         p_idx -= 1;
@@ -377,20 +416,20 @@ impl PieceTable {
                             Source::Original => &self.original,
                             Source::Added => &self.added,
                         };
-                        let pt = &ps[pp.start..pp.start + pp.length];
-                        if let Some(idx) = pt.rfind('\n') {
-                            c += pt[idx+1..].chars().count();
+                        if !pp.line_starts.is_empty() {
+                            let last_ls = *pp.line_starts.last().unwrap();
+                            c += ps[pp.start + last_ls..pp.start + pp.length].chars().count();
                             break;
                         } else {
-                            c += pt.chars().count();
+                            c += ps[pp.start..pp.start + pp.length].chars().count();
                         }
                     }
                     c
                 };
-                return (current_line + line_in_piece, col);
+                return (current_line + lines_before, col);
             }
             current_line += piece.line_breaks();
-            current_offset += piece.length;
+            current_offset = piece_end;
         }
         (self.line_count().saturating_sub(1), 0)
     }
