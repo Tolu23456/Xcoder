@@ -1,36 +1,56 @@
 #![deny(warnings)]
 use std::ops::Range;
+use std::time::Instant;
+use std::io::Write;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Source {
     Original,
     Added,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Piece {
     pub source: Source,
     pub start: usize,
     pub length: usize,
+    pub line_starts: Vec<usize>,
+}
+
+impl Piece {
+    pub fn line_breaks(&self) -> usize {
+        self.line_starts.len()
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct EditorStateSnapshot {
+    pub pieces: Vec<Piece>,
+    pub cursors: Vec<Cursor>,
+    pub group_id: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct PieceTable {
-    original: String,
-    added: String,
-    pieces: Vec<Piece>,
-    undo_stack: Vec<Vec<Piece>>,
-    redo_stack: Vec<Vec<Piece>>,
+    pub original: String,
+    pub added: String,
+    pub pieces: Vec<Piece>,
+    pub undo_stack: Vec<EditorStateSnapshot>,
+    pub redo_stack: Vec<EditorStateSnapshot>,
+    pub last_op_time: Instant,
+    pub current_group_id: u64,
 }
 
 impl PieceTable {
     pub fn new(content: String) -> Self {
+        let line_starts = Self::find_line_starts(&content);
         let length = content.len();
         let pieces = if length > 0 {
             vec![Piece {
                 source: Source::Original,
                 start: 0,
                 length,
+                line_starts,
             }]
         } else {
             vec![]
@@ -42,147 +62,218 @@ impl PieceTable {
             pieces,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            last_op_time: Instant::now() - std::time::Duration::from_secs(5),
+            current_group_id: 0,
         }
+    }
+
+    fn find_line_starts(text: &str) -> Vec<usize> {
+        let mut starts = Vec::new();
+        for (i, c) in text.char_indices() {
+            if c == '\n' {
+                starts.push(i + 1);
+            }
+        }
+        starts
     }
 
     pub fn len(&self) -> usize {
         self.pieces.iter().map(|p| p.length).sum()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.pieces.is_empty()
+    pub fn line_count(&self) -> usize {
+        self.pieces.iter().map(|p| p.line_breaks()).sum::<usize>() + 1
     }
 
-    fn save_state(&mut self) {
-        self.undo_stack.push(self.pieces.clone());
-        self.redo_stack.clear();
-        if self.undo_stack.len() > 1000 {
-            self.undo_stack.remove(0);
+    pub fn is_char_boundary(&self, offset: usize) -> bool {
+        if offset == 0 || offset == self.len() { return true; }
+        if offset > self.len() { return false; }
+        let (p_idx, offset_in_p) = self.find_piece_at_offset(offset);
+        if p_idx >= self.pieces.len() { return false; }
+        let piece = &self.pieces[p_idx];
+        let source_str = match piece.source {
+            Source::Original => &self.original,
+            Source::Added => &self.added,
+        };
+        source_str.is_char_boundary(piece.start + offset_in_p)
+    }
+
+    pub fn save_state(&mut self, cursors: Vec<Cursor>, force_new_group: bool) {
+        let now = Instant::now();
+        let should_start_new_group = force_new_group || now.duration_since(self.last_op_time).as_secs() >= 2;
+
+        if should_start_new_group {
+            self.current_group_id += 1;
         }
+
+        if should_start_new_group || self.undo_stack.is_empty() {
+            self.undo_stack.push(EditorStateSnapshot {
+                pieces: self.pieces.clone(),
+                cursors,
+                group_id: self.current_group_id,
+            });
+            self.redo_stack.clear();
+            if self.undo_stack.len() > 1000 {
+                self.undo_stack.remove(0);
+            }
+        }
+        self.last_op_time = now;
     }
 
-    pub fn insert(&mut self, offset: usize, text: &str) {
+    pub fn insert(&mut self, offset: usize, text: &str) -> Result<(), &'static str> {
         if text.is_empty() {
-            return;
+            return Ok(());
         }
-        // Ensure offset is a char boundary
-        let content = self.collect_content();
-        if !content.is_char_boundary(offset) {
-            return;
+        if !self.is_char_boundary(offset) {
+            return Err("Insert offset is not a char boundary");
         }
-
-        self.save_state();
+        let (piece_idx, offset_in_piece) = self.find_piece_at_offset(offset);
         let added_start = self.added.len();
         self.added.push_str(text);
+        let line_starts = Self::find_line_starts(text);
         let new_piece = Piece {
             source: Source::Added,
             start: added_start,
             length: text.len(),
+            line_starts,
         };
-
         if self.pieces.is_empty() {
             self.pieces.push(new_piece);
-            return;
-        }
-
-        let (piece_idx, offset_in_piece) = self.find_piece_at_offset(offset);
-
-        if piece_idx == self.pieces.len() {
-            self.pieces.push(new_piece);
+        } else if piece_idx == self.pieces.len() {
+            let last = self.pieces.last_mut().unwrap();
+            if last.source == Source::Added && last.start + last.length == added_start {
+                last.line_starts.extend(Self::find_line_starts(text).into_iter().map(|ls| ls + last.length));
+                last.length += text.len();
+            } else {
+                self.pieces.push(new_piece);
+            }
         } else if offset_in_piece == 0 {
             self.pieces.insert(piece_idx, new_piece);
         } else {
-            let piece = self.pieces[piece_idx];
+            let piece = self.pieces[piece_idx].clone();
+            let mut left_lines = Vec::new();
+            let mut right_lines = Vec::new();
+            for &ls in &piece.line_starts {
+                if ls <= offset_in_piece {
+                    left_lines.push(ls);
+                } else {
+                    right_lines.push(ls - offset_in_piece);
+                }
+            }
             let left = Piece {
                 source: piece.source,
                 start: piece.start,
                 length: offset_in_piece,
+                line_starts: left_lines,
             };
             let right = Piece {
                 source: piece.source,
                 start: piece.start + offset_in_piece,
                 length: piece.length - offset_in_piece,
+                line_starts: right_lines,
             };
-
             self.pieces[piece_idx] = left;
             self.pieces.insert(piece_idx + 1, new_piece);
             self.pieces.insert(piece_idx + 2, right);
         }
+        Ok(())
     }
 
-    pub fn delete(&mut self, range: Range<usize>) {
-        if range.start >= range.end || range.start >= self.len() {
-            return;
+    pub fn delete(&mut self, range: Range<usize>) -> Result<(), &'static str> {
+        if range.start >= range.end {
+            return Ok(());
         }
-
-        let content = self.collect_content();
-        if !content.is_char_boundary(range.start) || !content.is_char_boundary(range.end) {
-            return;
+        if !self.is_char_boundary(range.start) || !self.is_char_boundary(range.end) {
+            return Err("Delete range boundaries are not char boundaries");
         }
-
-        self.save_state();
-
         let start = range.start;
         let end = range.end.min(self.len());
-
         let mut new_pieces = Vec::new();
         let mut current_offset = 0;
-
         for piece in &self.pieces {
             let piece_end = current_offset + piece.length;
-
             if piece_end <= start || current_offset >= end {
-                new_pieces.push(*piece);
+                new_pieces.push(piece.clone());
             } else {
                 if current_offset < start {
+                    let len = start - current_offset;
+                    let mut lines = Vec::new();
+                    for &ls in &piece.line_starts {
+                        if ls <= len {
+                            lines.push(ls);
+                        }
+                    }
                     new_pieces.push(Piece {
                         source: piece.source,
                         start: piece.start,
-                        length: start - current_offset,
+                        length: len,
+                        line_starts: lines,
                     });
                 }
-
                 if piece_end > end {
+                    let split_offset = end - current_offset;
+                    let len = piece_end - end;
+                    let mut lines = Vec::new();
+                    for &ls in &piece.line_starts {
+                        if ls > split_offset {
+                            lines.push(ls - split_offset);
+                        }
+                    }
                     new_pieces.push(Piece {
                         source: piece.source,
-                        start: piece.start + (end - current_offset),
-                        length: piece_end - end,
+                        start: piece.start + split_offset,
+                        length: len,
+                        line_starts: lines,
                     });
                 }
             }
             current_offset = piece_end;
         }
         self.pieces = new_pieces;
+        Ok(())
     }
 
     fn find_piece_at_offset(&self, offset: usize) -> (usize, usize) {
         let mut current_offset = 0;
         for (i, piece) in self.pieces.iter().enumerate() {
-            if offset >= current_offset && offset < current_offset + piece.length {
-                return (i, offset - current_offset);
+            if offset >= current_offset && offset <= current_offset + piece.length {
+                if offset == current_offset + piece.length && i < self.pieces.len() - 1 {
+                } else {
+                    return (i, offset - current_offset);
+                }
             }
             current_offset += piece.length;
         }
         (self.pieces.len(), 0)
     }
 
-    pub fn undo(&mut self) -> bool {
-        if let Some(state) = self.undo_stack.pop() {
-            self.redo_stack.push(self.pieces.clone());
-            self.pieces = state;
-            true
+    pub fn undo(&mut self, current_cursors: Vec<Cursor>) -> Option<Vec<Cursor>> {
+        if let Some(snapshot) = self.undo_stack.pop() {
+            self.redo_stack.push(EditorStateSnapshot {
+                pieces: self.pieces.clone(),
+                cursors: current_cursors,
+                group_id: snapshot.group_id,
+            });
+            self.pieces = snapshot.pieces;
+            self.last_op_time = Instant::now() - std::time::Duration::from_secs(5);
+            Some(snapshot.cursors)
         } else {
-            false
+            None
         }
     }
 
-    pub fn redo(&mut self) -> bool {
-        if let Some(state) = self.redo_stack.pop() {
-            self.undo_stack.push(self.pieces.clone());
-            self.pieces = state;
-            true
+    pub fn redo(&mut self, current_cursors: Vec<Cursor>) -> Option<Vec<Cursor>> {
+        if let Some(snapshot) = self.redo_stack.pop() {
+            self.undo_stack.push(EditorStateSnapshot {
+                pieces: self.pieces.clone(),
+                cursors: current_cursors,
+                group_id: snapshot.group_id,
+            });
+            self.pieces = snapshot.pieces;
+            self.last_op_time = Instant::now() - std::time::Duration::from_secs(5);
+            Some(snapshot.cursors)
         } else {
-            false
+            None
         }
     }
 
@@ -198,21 +289,153 @@ impl PieceTable {
         content
     }
 
-    pub fn search(&self, query: &str) -> Vec<Range<usize>> {
-        let content = self.collect_content();
-        content.match_indices(query).map(|(i, s)| i..i+s.len()).collect()
+    pub fn stream_write<W: Write>(&self, mut writer: W) -> std::io::Result<()> {
+        for piece in &self.pieces {
+            let source_str = match piece.source {
+                Source::Original => &self.original,
+                Source::Added => &self.added,
+            };
+            writer.write_all(source_str[piece.start..piece.start + piece.length].as_bytes())?;
+        }
+        Ok(())
     }
 
-    pub fn replace_all(&mut self, query: &str, replacement: &str) {
-        let matches = self.search(query);
-        for range in matches.into_iter().rev() {
-            self.delete(range.clone());
-            self.insert(range.start, replacement);
+    pub fn search(&self, query: &str, case_sensitive: bool) -> Vec<Range<usize>> {
+        let mut results = Vec::new();
+        let query_text = if case_sensitive { query.to_string() } else { query.to_lowercase() };
+        if query_text.is_empty() { return results; }
+
+        let mut current_offset = 0;
+        let mut overlap_buffer = String::new();
+        let query_len = query.len();
+
+        for piece in &self.pieces {
+            let source_str = match piece.source {
+                Source::Original => &self.original,
+                Source::Added => &self.added,
+            };
+            let piece_text = &source_str[piece.start..piece.start + piece.length];
+            let mut search_segment = if case_sensitive {
+                piece_text.to_string()
+            } else {
+                piece_text.to_lowercase()
+            };
+
+            // Prepend overlap from previous piece
+            let overlap_len = overlap_buffer.len();
+            if overlap_len > 0 {
+                search_segment = overlap_buffer.clone() + &search_segment;
+            }
+
+            let mut start = 0;
+            while let Some(pos) = search_segment[start..].find(&query_text) {
+                let segment_pos = start + pos;
+                let actual_pos = (current_offset + segment_pos).saturating_sub(overlap_len);
+                results.push(actual_pos..actual_pos + query_len);
+                start = segment_pos + query_len.max(1);
+            }
+
+            // Save end of current piece for next overlap (up to query_len - 1)
+            let next_overlap_start = search_segment.len().saturating_sub(query_len.saturating_sub(1));
+            overlap_buffer = search_segment[next_overlap_start..].to_string();
+
+            current_offset += piece.length;
         }
+        results
+    }
+
+    pub fn get_line(&self, line_idx: usize) -> Option<String> {
+        let mut current_line = 0;
+        for (p_idx, piece) in self.pieces.iter().enumerate() {
+            let piece_line_breaks = piece.line_breaks();
+            if current_line + piece_line_breaks >= line_idx {
+                let source_str = match piece.source {
+                    Source::Original => &self.original,
+                    Source::Added => &self.added,
+                };
+                let start_in_piece = if line_idx > current_line {
+                    piece.line_starts[line_idx - current_line - 1]
+                } else {
+                    0
+                };
+                let mut line = String::new();
+                line.push_str(&source_str[piece.start + start_in_piece..piece.start + piece.length]);
+                let mut next_p = p_idx + 1;
+                while !line.contains('\n') && next_p < self.pieces.len() {
+                    let np = &self.pieces[next_p];
+                    let ns = match np.source {
+                        Source::Original => &self.original,
+                        Source::Added => &self.added,
+                    };
+                    line.push_str(&ns[np.start..np.start + np.length]);
+                    next_p += 1;
+                }
+                if let Some(pos) = line.find('\n') {
+                    line.truncate(pos + 1);
+                }
+                return Some(line);
+            }
+            current_line += piece_line_breaks;
+        }
+        None
+    }
+
+    pub fn get_line_col(&self, pos: usize) -> (usize, usize) {
+        let mut current_line = 0;
+        let mut current_offset = 0;
+        for piece in &self.pieces {
+            let piece_end = current_offset + piece.length;
+            if pos <= piece_end {
+                let offset_in_piece = pos - current_offset;
+                let source_str = match piece.source {
+                    Source::Original => &self.original,
+                    Source::Added => &self.added,
+                };
+
+                // Use line_starts index for faster calculation
+                let mut lines_before = 0;
+                let mut last_line_start = 0;
+                for &ls in &piece.line_starts {
+                    if ls <= offset_in_piece {
+                        lines_before += 1;
+                        last_line_start = ls;
+                    } else {
+                        break;
+                    }
+                }
+
+                let col = if lines_before > 0 {
+                    source_str[piece.start + last_line_start..piece.start + offset_in_piece].chars().count()
+                } else {
+                    let mut c = source_str[piece.start..piece.start + offset_in_piece].chars().count();
+                    let mut p_idx = self.pieces.iter().position(|p| p as *const _ == piece as *const _).unwrap();
+                    while p_idx > 0 {
+                        p_idx -= 1;
+                        let pp = &self.pieces[p_idx];
+                        let ps = match pp.source {
+                            Source::Original => &self.original,
+                            Source::Added => &self.added,
+                        };
+                        if !pp.line_starts.is_empty() {
+                            let last_ls = *pp.line_starts.last().unwrap();
+                            c += ps[pp.start + last_ls..pp.start + pp.length].chars().count();
+                            break;
+                        } else {
+                            c += ps[pp.start..pp.start + pp.length].chars().count();
+                        }
+                    }
+                    c
+                };
+                return (current_line + lines_before, col);
+            }
+            current_line += piece.line_breaks();
+            current_offset = piece_end;
+        }
+        (self.line_count().saturating_sub(1), 0)
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Cursor {
     pub position: usize,
     pub selection_anchor: Option<usize>,
@@ -236,76 +459,104 @@ impl Document {
         }
     }
 
-    pub fn insert(&mut self, char_idx: usize, text: &str) {
-        self.buffer.insert(char_idx, text);
-    }
-
-    pub fn remove(&mut self, range: Range<usize>) {
-        self.buffer.delete(range);
-    }
-
-    pub fn insert_at_cursors(&mut self, text: &str) {
+    pub fn insert_at_cursors(&mut self, text: &str) -> Vec<(Range<usize>, String)> {
+        let mut changes = Vec::new();
+        self.buffer.save_state(self.cursors.clone(), false);
         self.cursors.sort_by(|a, b| b.position.cmp(&a.position));
         for i in 0..self.cursors.len() {
             let mut cursor = self.cursors[i];
             if let Some(anchor) = cursor.selection_anchor {
                 let range = if anchor < cursor.position { anchor..cursor.position } else { cursor.position..anchor };
-                self.buffer.delete(range.clone());
+                let _ = self.buffer.delete(range.clone());
+                changes.push((range.clone(), String::new()));
                 cursor.position = range.start;
                 cursor.selection_anchor = None;
             }
-            self.buffer.insert(cursor.position, text);
+            let _ = self.buffer.insert(cursor.position, text);
+            changes.push((cursor.position..cursor.position, text.to_string()));
             cursor.position += text.len();
             self.cursors[i] = cursor;
         }
+        changes
     }
 
-    pub fn delete_at_cursors(&mut self) {
+    pub fn delete_at_cursors(&mut self) -> Vec<(Range<usize>, String)> {
+        let mut changes = Vec::new();
+        self.buffer.save_state(self.cursors.clone(), false);
         self.cursors.sort_by(|a, b| b.position.cmp(&a.position));
-        let content = self.buffer.collect_content();
         for i in 0..self.cursors.len() {
             let mut cursor = self.cursors[i];
             if let Some(anchor) = cursor.selection_anchor {
                 let range = if anchor < cursor.position { anchor..cursor.position } else { cursor.position..anchor };
-                self.buffer.delete(range.clone());
+                let _ = self.buffer.delete(range.clone());
+                changes.push((range.clone(), String::new()));
                 cursor.position = range.start;
                 cursor.selection_anchor = None;
             } else if cursor.position > 0 {
-                let prev = self.find_prev_char_boundary(&content, cursor.position);
-                self.buffer.delete(prev..cursor.position);
+                let prev = self.find_prev_char_boundary(cursor.position);
+                let range = prev..cursor.position;
+                let _ = self.buffer.delete(range.clone());
+                changes.push((range, String::new()));
                 cursor.position = prev;
             }
             self.cursors[i] = cursor;
         }
+        changes
     }
 
-    fn find_prev_char_boundary(&self, content: &str, pos: usize) -> usize {
+    pub fn find_prev_char_boundary(&self, pos: usize) -> usize {
         let mut current = pos;
         while current > 0 {
             current -= 1;
-            if content.is_char_boundary(current) {
+            if self.buffer.is_char_boundary(current) {
                 return current;
             }
         }
         0
     }
 
-    pub fn add_cursor(&mut self, position: usize) {
-        self.cursors.push(Cursor { position, selection_anchor: None });
+    pub fn find_next_char_boundary(&self, pos: usize) -> usize {
+        let mut current = pos;
+        let len = self.buffer.len();
+        while current < len {
+            current += 1;
+            if self.buffer.is_char_boundary(current) {
+                return current;
+            }
+        }
+        len
+    }
+
+    pub fn get_line_col(&self, pos: usize) -> (usize, usize) {
+        self.buffer.get_line_col(pos)
+    }
+
+    pub fn undo(&mut self) {
+        if let Some(cursors) = self.buffer.undo(self.cursors.clone()) {
+            self.cursors = cursors;
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if let Some(cursors) = self.buffer.redo(self.cursors.clone()) {
+            self.cursors = cursors;
+        }
     }
 
     pub fn to_string(&self) -> String {
         self.buffer.collect_content()
-    }
-
-    pub fn len_chars(&self) -> usize {
-        self.buffer.len()
     }
 }
 
 impl Default for Document {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Display for Document {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_string())
     }
 }
 
@@ -316,32 +567,26 @@ mod tests {
     #[test]
     fn test_piece_table_basic() {
         let mut pt = PieceTable::new("Hello World".to_string());
-        pt.insert(5, ",");
+        pt.insert(5, ",").unwrap();
         assert_eq!(pt.collect_content(), "Hello, World");
-        pt.delete(5..6);
+        pt.delete(5..6).unwrap();
         assert_eq!(pt.collect_content(), "Hello World");
     }
 
     #[test]
-    fn test_undo_redo() {
+    fn test_search() {
+        let pt = PieceTable::new("The quick brown fox".to_string());
+        let results = pt.search("quick", true);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], 4..9);
+    }
+
+    #[test]
+    fn test_streaming_write() {
         let mut pt = PieceTable::new("Hello".to_string());
-        pt.insert(5, " World");
-        assert_eq!(pt.collect_content(), "Hello World");
-        pt.undo();
-        assert_eq!(pt.collect_content(), "Hello");
-        pt.redo();
-        assert_eq!(pt.collect_content(), "Hello World");
-    }
-
-    #[test]
-    fn test_multi_cursor() {
-        let mut doc = Document::from_str("A B C");
-        doc.cursors = vec![
-            Cursor { position: 0, selection_anchor: None },
-            Cursor { position: 2, selection_anchor: None },
-            Cursor { position: 4, selection_anchor: None },
-        ];
-        doc.insert_at_cursors("!");
-        assert_eq!(doc.to_string(), "!A !B !C");
+        pt.insert(5, " World").unwrap();
+        let mut output = Vec::new();
+        pt.stream_write(&mut output).unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), "Hello World");
     }
 }
