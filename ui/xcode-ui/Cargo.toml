@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-taffy = "0.7.1"
+taffy.workspace = true
 xcode-core = { version = "0.1.0", path = "../../core/xcode-core" }

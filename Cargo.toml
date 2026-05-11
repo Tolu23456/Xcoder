@@ -1,5 +1,4 @@
 [workspace]
-
 members = [
     "core/xcode-core",
     "renderer/xcode-renderer",
@@ -9,6 +8,23 @@ members = [
     "plugin-runtime/xcode-plugin-runtime"
 ]
 
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+tree-sitter = "0.24.7"
+tree-sitter-rust = "0.23.2"
+taffy = "0.7.1"
+pollster = "0.4.0"
+wgpu = { version = "29.0.3", default-features = false, features = ["wgsl", "vulkan"] }
+winit = "0.30.13"
+bytemuck = { version = "1.21.0", features = ["derive"] }
+env_logger = "0.11.10"
+glyphon = "0.11.0"
+log = "0.4.29"
+vte = "0.14.0"
+portable-pty = "0.9.0"
+
 [package]
 name = "Xcode"
 version = "0.1.0"
@@ -16,5 +32,12 @@ edition = "2021"
 
 [dependencies]
 xcode-renderer = { path = "renderer/xcode-renderer" }
-pollster = "0.4.0"
-# Top-level dependencies for the editor entry point
+pollster.workspace = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+panic = "abort"
+strip = true
+incremental = true
